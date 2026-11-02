@@ -722,6 +722,7 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
       toggleLibrary = ::toggleLibrary
       onAutomotiveConnected = { prefetchQueueArtwork() }
     }
+    mediaLibrarySessionCallback.playerProvider = { if (::player.isInitialized) player else null }
     mediaSession =
       MediaLibrarySession.Builder(this, SessionArtworkPlayer(this, player), mediaLibrarySessionCallback)
         .setSessionActivity(
@@ -1941,7 +1942,7 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
     originalQueueSize = originalQueueSize.coerceAtMost(player.mediaItemCount)
 
     resyncCastQueueIfCasting()
-
+    mediaLibrarySessionCallback.saveProgress()
     if (dataStore.get(PersistentQueueKey, true)) {
       saveQueueToDisk()
     }
@@ -2517,7 +2518,7 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
         }
         return
       }
-
+      mediaLibrarySessionCallback.saveProgress()
       if (cachedRepeatMode == REPEAT_MODE_ALL && player.mediaItemCount > 0) {
         player.seekTo(0, 0)
         player.prepare()
@@ -2556,7 +2557,7 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
       player.pause()
       return
     }
-
+        if (!playWhenReady) mediaLibrarySessionCallback.saveProgress()
     if (reason == Player.PLAY_WHEN_READY_CHANGE_REASON_USER_REQUEST) {
       if (playWhenReady) {
         isPausedByVolumeMute = false
@@ -3861,6 +3862,7 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
     audioManager.unregisterAudioDeviceCallback(audioDeviceCallback)
     usbDacManager.unregister()
     castConnectionHandler?.release()
+    mediaLibrarySessionCallback.saveProgress()
     if (dataStore.get(PersistentQueueKey, true)) {
       saveQueueToDisk()
     }
