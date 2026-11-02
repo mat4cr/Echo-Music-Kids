@@ -1,0 +1,38 @@
+name: Build debug APK
+
+on:
+  workflow_dispatch:   # ruční spuštění tlačítkem "Run workflow"
+  push:                # a automaticky po každém commitu
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21   # kdyby build stěžoval na verzi Javy, zkus 17
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Make gradlew executable
+        run: chmod +x gradlew
+
+      - name: Build arm64 Foss debug
+        run: ./gradlew :app:assembleArm64FossDebug --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: echo-music-arm64-foss-debug
+          path: app/build/outputs/apk/**/*.apk
+          if-no-files-found: error
