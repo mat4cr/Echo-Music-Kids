@@ -1942,7 +1942,6 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
     originalQueueSize = originalQueueSize.coerceAtMost(player.mediaItemCount)
 
     resyncCastQueueIfCasting()
-    mediaLibrarySessionCallback.saveProgress()
     if (dataStore.get(PersistentQueueKey, true)) {
       saveQueueToDisk()
     }
@@ -2557,7 +2556,7 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
       player.pause()
       return
     }
-        if (!playWhenReady) mediaLibrarySessionCallback.saveProgress()
+    if (!playWhenReady) mediaLibrarySessionCallback.saveProgress()
     if (reason == Player.PLAY_WHEN_READY_CHANGE_REASON_USER_REQUEST) {
       if (playWhenReady) {
         isPausedByVolumeMute = false
