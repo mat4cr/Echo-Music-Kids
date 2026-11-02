@@ -357,4 +357,5 @@ dependencies {
   testImplementation(libs.junit)
   testImplementation(libs.kotlinx.coroutines.test)
   testImplementation(libs.robolectric)
+  implementation("org.jsoup:jsoup:1.17.2")
 }
