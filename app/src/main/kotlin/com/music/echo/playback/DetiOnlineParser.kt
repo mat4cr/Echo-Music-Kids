@@ -17,6 +17,20 @@ data class DetiTaleItem(
     val durationMin: Int? = null // délka pohádky v minutách (jen u katalogu), null = neznámá
 )
 
+/** Odkaz na věkovou kategorii ("filtr podle věku" na webu). maxAge == null -> "minAge a víc". */
+data class DetiAgeLink(
+    val slug: String,
+    val url: String,
+    val minAge: Int,
+    val maxAge: Int?
+)
+
+/** Jedna stránka katalogu: pohádky (v pořadí z webu = podle oblíbenosti) + nalezené věkové filtry. */
+data class DetiCatalogPage(
+    val items: List<DetiTaleItem>,
+    val ageLinks: List<DetiAgeLink>
+)
+
 class DetiOnlineParser {
 
     companion object {
@@ -25,13 +39,19 @@ class DetiOnlineParser {
         private const val USER_AGENT = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36"
         private const val TIMEOUT_MS = 10_000
 
+        const val TOP_URL = "https://deti-online.com/audioskazki/"
         const val DEFAULT_CATALOG_URL = "https://deti-online.com/audioskazki/sbornik-skazok-mp3/"
         const val AGE_2_3_URL = "https://deti-online.com/audioskazki/dlya-malyshey-2-3-let/"
         const val AGE_4_5_URL = "https://deti-online.com/audioskazki/dlya-detey-4-5-let/"
         const val AGE_6_7_URL = "https://deti-online.com/audioskazki/dlya-detey-6-7-let/"
 
-        private val HOURS_REGEX = Regex("""(\d+)\s*ч(?![а-яё])""")
-        private val MINUTES_REGEX = Regex("""(\d+)\s*мин""")
+        /** Odkud se bere "Top pohádek" (první dostupná stránka s výsledky). */
+        val TOP_URLS = listOf(TOP_URL, DEFAULT_CATALOG_URL)
+
+        private val HOURS_MIN_REGEX = Regex("""(\d+)\s*ч(?!\p{L})\s*(?:(\d+)\s*мин(?!\p{L}))?""")
+        private val MINUTES_REGEX = Regex("""(\d+)\s*мин(?!\p{L})""")
+        private val SPACES_REGEX = Regex("""\s+""")
+        private val NUMBER_REGEX = Regex("""\d+""")
     }
 
     private fun fetch(url: String): Document =
@@ -40,24 +60,29 @@ class DetiOnlineParser {
             .timeout(TIMEOUT_MS)
             .get()
 
-    /**
-     * Stáhne seznam pohádek ze stránky katalogu (sbírka, věková kategorie, ...)
-     */
+    /** Jen pohádky (kvůli zpětné kompatibilitě). */
     suspend fun getCatalog(catalogUrl: String = DEFAULT_CATALOG_URL): List<DetiTaleItem> =
+        getCatalogPage(catalogUrl).items
+
+    /**
+     * Stáhne stránku katalogu (úvodní stránka, sbírka, věková kategorie, ...):
+     * seznam pohádek + odkazy na věkové filtry.
+     */
+    suspend fun getCatalogPage(catalogUrl: String = DEFAULT_CATALOG_URL): DetiCatalogPage =
         withContext(Dispatchers.IO) {
             try {
                 val doc = fetch(catalogUrl)
                 val primary = parseCatalogPrimary(doc)
                 val fallback = parseCatalogFallback(doc)
-                val result = (if (fallback.size > primary.size) fallback else primary)
+                val items = (if (fallback.size > primary.size) fallback else primary)
                     .distinctBy { it.id }
-                if (result.isEmpty()) Timber.tag(TAG).w("Katalog %s je prázdný (změnil se HTML?)", catalogUrl)
-                result
+                if (items.isEmpty()) Timber.tag(TAG).w("Katalog %s je prázdný (změnil se HTML?)", catalogUrl)
+                DetiCatalogPage(items, parseAgeLinks(doc))
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                Timber.tag(TAG).e(e, "getCatalog selhalo pro %s", catalogUrl)
-                emptyList()
+                Timber.tag(TAG).e(e, "getCatalogPage selhalo pro %s", catalogUrl)
+                DetiCatalogPage(emptyList(), emptyList())
             }
         }
 
@@ -66,7 +91,7 @@ class DetiOnlineParser {
         val list = mutableListOf<DetiTaleItem>()
         for (el in doc.select(".scroll-grid-img-wrap .item, .grid-img .item")) {
             val linkEl = el.selectFirst("a.a") ?: el.selectFirst("a[href]") ?: continue
-            val title = el.select(".t2").text().ifEmpty { linkEl.text() }.trim()
+            val title = stripDuration(el.select(".t2").text().ifEmpty { linkEl.text() })
             val href = absolute(linkEl.attr("href"))
             if (title.isNotEmpty() && href.isNotEmpty()) {
                 list.add(
@@ -85,7 +110,7 @@ class DetiOnlineParser {
 
     /**
      * Záloha: libovolný odkaz na detail pohádky (/audioskazki/<sekce>/<pohádka>/), který obsahuje obrázek.
-     * Funguje na katalogu i na věkových stránkách.
+     * Funguje na úvodní stránce, katalogu i na věkových stránkách.
      */
     private fun parseCatalogFallback(doc: Document): List<DetiTaleItem> {
         val list = mutableListOf<DetiTaleItem>()
@@ -93,7 +118,7 @@ class DetiOnlineParser {
             val href = absolute(a.attr("href")).substringBefore('#')
             if (!isTaleLink(href)) continue
             val img = a.selectFirst("img")
-            val title = a.text().trim().ifEmpty { img?.attr("alt")?.trim().orEmpty() }
+            val title = stripDuration(a.text().ifEmpty { img?.attr("alt").orEmpty() })
             if (title.isEmpty()) continue
             list.add(
                 DetiTaleItem(
@@ -101,11 +126,30 @@ class DetiOnlineParser {
                     title = title,
                     isCategory = true,
                     artworkUrl = imageUrl(img),
-                    durationMin = parseDurationMinutes(containerText(a))
+                    durationMin = parseDurationMinutes(a.text())
+                        ?: parseDurationMinutes(containerText(a))
                 )
             )
         }
         return list
+    }
+
+    /** Věkové filtry ("pro 2-3 roky" apod.): odkazy /audioskazki/dlya-.../ - věk se čte z čísel v adrese. */
+    private fun parseAgeLinks(doc: Document): List<DetiAgeLink> {
+        val prefix = "$BASE_URL/audioskazki/"
+        val found = LinkedHashMap<String, DetiAgeLink>()
+        for (a in doc.select("a[href*=/audioskazki/dlya-]")) {
+            val href = absolute(a.attr("href")).substringBefore('#').substringBefore('?')
+            if (!href.startsWith(prefix)) continue
+            val slug = href.removePrefix(prefix).trim('/')
+            if (slug.isEmpty() || slug.contains('/') || !slug.startsWith("dlya-")) continue
+            val numbers = NUMBER_REGEX.findAll(slug).mapNotNull { it.value.toIntOrNull() }.toList()
+            if (numbers.isEmpty()) continue
+            found.getOrPut(slug) { DetiAgeLink(slug, "$prefix$slug/", numbers[0], numbers.getOrNull(1)) }
+        }
+        return found.values
+            .distinctBy { it.minAge to it.maxAge }
+            .sortedWith(compareBy<DetiAgeLink>({ it.minAge }, { it.maxAge ?: Int.MAX_VALUE }))
     }
 
     /**
@@ -169,14 +213,23 @@ class DetiOnlineParser {
         return a.parent()?.text().orEmpty()
     }
 
-    /** "1 ч 10 мин" -> 70, "5 мин" -> 5, "2 ч" -> 120, jinak null. Hledá se na konci textu. */
+    /** "1 ч 10 мин" -> 70, "5 мин" -> 5, "2 ч" -> 120, jinak null. Hledá se kdekoli v textu. */
     private fun parseDurationMinutes(text: String): Int? {
-        val tail = text.trim().takeLast(24)
-        val hours = HOURS_REGEX.find(tail)?.groupValues?.get(1)?.toIntOrNull()
-        val minutes = MINUTES_REGEX.find(tail)?.groupValues?.get(1)?.toIntOrNull()
-        if (hours == null && minutes == null) return null
-        return (hours ?: 0) * 60 + (minutes ?: 0)
+        val hm = HOURS_MIN_REGEX.find(text)
+        if (hm != null) {
+            val hours = hm.groupValues[1].toIntOrNull() ?: 0
+            val minutes = hm.groupValues[2].toIntOrNull() ?: 0
+            return hours * 60 + minutes
+        }
+        return MINUTES_REGEX.find(text)?.groupValues?.get(1)?.toIntOrNull()
     }
+
+    /** Odstraní z názvu případný text délky ("127 ч 20 мин"), který je v odkazu spolu s obrázkem. */
+    private fun stripDuration(text: String): String =
+        text.replace(HOURS_MIN_REGEX, " ")
+            .replace(MINUTES_REGEX, " ")
+            .replace(SPACES_REGEX, " ")
+            .trim()
 
     private fun absolute(url: String): String {
         val u = url.trim()
