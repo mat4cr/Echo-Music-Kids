@@ -3,6 +3,7 @@ package echo.music.iad1tya.playback
 import android.content.Context
 import android.net.Uri
 import android.os.Bundle
+import android.os.Looper
 import android.os.SystemClock
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
@@ -82,13 +83,16 @@ class MediaLibrarySessionCallback @Inject constructor(
 
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     private val detiParser = DetiOnlineParser()
-    private val history = DetiHistoryStore(context)
+    private val history = DetiResumeStore(context)
 
     // Callbacky pro vlastní tlačítka v ovládání přehrávače
     var toggleLike: (() -> Unit)? = null
     var toggleStartRadio: (() -> Unit)? = null
     var toggleLibrary: (() -> Unit)? = null
     var onAutomotiveConnected: (() -> Unit)? = null
+
+    /** Nastavuje MusicService; slouží jako záloha, kdyby se tracker ještě nepřipojil přes onConnect. */
+    var playerProvider: (() -> Player?)? = null
 
     // ---- Cache ----------------------------------------------------------------------------
 
@@ -134,13 +138,13 @@ class MediaLibrarySessionCallback @Inject constructor(
 
     private val trackerListener = object : Player.Listener {
         override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
-            saveProgress()
+            saveProgressNow()
         }
 
         override fun onIsPlayingChanged(isPlaying: Boolean) {
             if (isPlaying) startTicker() else {
                 stopTicker()
-                saveProgress()
+                saveProgressNow()
             }
         }
 
@@ -165,7 +169,7 @@ class MediaLibrarySessionCallback @Inject constructor(
         tickerJob = scope.launch {
             while (isActive) {
                 delay(SAVE_INTERVAL_MS)
-                saveProgress()
+                saveProgressNow()
             }
         }
     }
@@ -175,8 +179,22 @@ class MediaLibrarySessionCallback @Inject constructor(
         tickerJob = null
     }
 
-    private fun saveProgress() {
-        val player = trackedPlayer ?: return
+    private fun currentPlayer(): Player? = trackedPlayer ?: playerProvider?.invoke()
+
+    /**
+     * Uloží aktuální kapitolu a pozici do historie. Veřejné - volá ho i MusicService.
+     * Bezpečné volat z libovolného vlákna (přehrávač se čte vždy na hlavním vlákně).
+     */
+    fun saveProgress() {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            saveProgressNow()
+        } else {
+            scope.launch { saveProgressNow() }
+        }
+    }
+
+    private fun saveProgressNow() {
+        val player = currentPlayer() ?: return
         if (player.playbackState == Player.STATE_ENDED) return
         val item = player.currentMediaItem ?: return
         val extras = item.mediaMetadata.extras ?: return
@@ -185,7 +203,7 @@ class MediaLibrarySessionCallback @Inject constructor(
         if (index < 0) return
         try {
             history.upsert(
-                DetiHistoryEntry(
+                DetiResumeEntry(
                     taleId = taleId,
                     title = extras.getString(EXTRA_TALE_TITLE).orEmpty(),
                     artworkUrl = extras.getString(EXTRA_TALE_ARTWORK)?.ifEmpty { null },
@@ -203,7 +221,7 @@ class MediaLibrarySessionCallback @Inject constructor(
     /** Přehrála se poslední kapitola -> pohádka je hotová, vyhodíme ji z "Pokračovat". */
     private fun onTaleFinished() {
         stopTicker()
-        val taleId = trackedPlayer?.currentMediaItem?.mediaMetadata?.extras?.getString(EXTRA_TALE_ID)
+        val taleId = currentPlayer()?.currentMediaItem?.mediaMetadata?.extras?.getString(EXTRA_TALE_ID)
             ?: return
         history.remove(taleId)
     }
@@ -592,7 +610,7 @@ class MediaLibrarySessionCallback @Inject constructor(
             .build()
 
     /** Položka v "Pokračovat": přehratelná, po klepnutí naváže tam, kde se skončilo. */
-    private fun resumeItem(entry: DetiHistoryEntry): MediaItem =
+    private fun resumeItem(entry: DetiResumeEntry): MediaItem =
         MediaItem.Builder()
             .setMediaId("$RESUME_ITEM_PREFIX${entry.taleId}")
             .setMediaMetadata(
