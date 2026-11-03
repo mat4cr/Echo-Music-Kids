@@ -13,7 +13,8 @@ data class DetiTaleItem(
     val title: String,
     val isCategory: Boolean, // true = složka/pohádka k rozkliknutí, false = přehratelná kapitola
     val mediaUri: String? = null,
-    val artworkUrl: String? = null
+    val artworkUrl: String? = null,
+    val durationMin: Int? = null // délka pohádky v minutách (jen u katalogu), null = neznámá
 )
 
 class DetiOnlineParser {
@@ -21,9 +22,16 @@ class DetiOnlineParser {
     companion object {
         private const val TAG = "DetiOnlineParser"
         private const val BASE_URL = "https://deti-online.com"
-        private const val DEFAULT_CATALOG_URL = "$BASE_URL/audioskazki/sbornik-skazok-mp3/"
         private const val USER_AGENT = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36"
         private const val TIMEOUT_MS = 10_000
+
+        const val DEFAULT_CATALOG_URL = "https://deti-online.com/audioskazki/sbornik-skazok-mp3/"
+        const val AGE_2_3_URL = "https://deti-online.com/audioskazki/dlya-malyshey-2-3-let/"
+        const val AGE_4_5_URL = "https://deti-online.com/audioskazki/dlya-detey-4-5-let/"
+        const val AGE_6_7_URL = "https://deti-online.com/audioskazki/dlya-detey-6-7-let/"
+
+        private val HOURS_REGEX = Regex("""(\d+)\s*ч(?![а-яё])""")
+        private val MINUTES_REGEX = Regex("""(\d+)\s*мин""")
     }
 
     private fun fetch(url: String): Document =
@@ -33,20 +41,22 @@ class DetiOnlineParser {
             .get()
 
     /**
-     * Stáhne seznam pohádek / knih ze sbírky
+     * Stáhne seznam pohádek ze stránky katalogu (sbírka, věková kategorie, ...)
      */
     suspend fun getCatalog(catalogUrl: String = DEFAULT_CATALOG_URL): List<DetiTaleItem> =
         withContext(Dispatchers.IO) {
             try {
                 val doc = fetch(catalogUrl)
                 val primary = parseCatalogPrimary(doc)
-                val result = if (primary.isNotEmpty()) primary else parseCatalogFallback(doc, catalogUrl)
-                if (result.isEmpty()) Timber.tag(TAG).w("Katalog je prázdný (změnil se HTML?)")
-                result.distinctBy { it.id }
+                val fallback = parseCatalogFallback(doc)
+                val result = (if (fallback.size > primary.size) fallback else primary)
+                    .distinctBy { it.id }
+                if (result.isEmpty()) Timber.tag(TAG).w("Katalog %s je prázdný (změnil se HTML?)", catalogUrl)
+                result
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                Timber.tag(TAG).e(e, "getCatalog selhalo")
+                Timber.tag(TAG).e(e, "getCatalog selhalo pro %s", catalogUrl)
                 emptyList()
             }
         }
@@ -64,7 +74,8 @@ class DetiOnlineParser {
                         id = href,
                         title = title,
                         isCategory = true,
-                        artworkUrl = imageUrl(el.selectFirst("img"))
+                        artworkUrl = imageUrl(el.selectFirst("img")),
+                        durationMin = parseDurationMinutes(el.text())
                     )
                 )
             }
@@ -72,13 +83,15 @@ class DetiOnlineParser {
         return list
     }
 
-    /** Záloha: odkazy na detail pohádky, které obsahují obrázek */
-    private fun parseCatalogFallback(doc: Document, catalogUrl: String): List<DetiTaleItem> {
+    /**
+     * Záloha: libovolný odkaz na detail pohádky (/audioskazki/<sekce>/<pohádka>/), který obsahuje obrázek.
+     * Funguje na katalogu i na věkových stránkách.
+     */
+    private fun parseCatalogFallback(doc: Document): List<DetiTaleItem> {
         val list = mutableListOf<DetiTaleItem>()
-        val catalogPath = catalogUrl.trimEnd('/')
-        for (a in doc.select("a[href*=/audioskazki/sbornik-skazok-mp3/]:has(img)")) {
-            val href = absolute(a.attr("href"))
-            if (href.isEmpty() || href.trimEnd('/') == catalogPath) continue
+        for (a in doc.select("a[href*=/audioskazki/]:has(img)")) {
+            val href = absolute(a.attr("href")).substringBefore('#')
+            if (!isTaleLink(href)) continue
             val img = a.selectFirst("img")
             val title = a.text().trim().ifEmpty { img?.attr("alt")?.trim().orEmpty() }
             if (title.isEmpty()) continue
@@ -87,7 +100,8 @@ class DetiOnlineParser {
                     id = href,
                     title = title,
                     isCategory = true,
-                    artworkUrl = imageUrl(img)
+                    artworkUrl = imageUrl(img),
+                    durationMin = parseDurationMinutes(containerText(a))
                 )
             )
         }
@@ -134,6 +148,35 @@ class DetiOnlineParser {
     }
 
     // ---- Pomocné --------------------------------------------------------------------------
+
+    /** Detail pohádky má v cestě aspoň dva segmenty za /audioskazki/ (sekce + pohádka). */
+    private fun isTaleLink(href: String): Boolean {
+        val prefix = "$BASE_URL/audioskazki/"
+        if (!href.startsWith(prefix)) return false
+        val segments = href.removePrefix(prefix).trim('/').split('/')
+        return segments.size >= 2 && segments.all { it.isNotEmpty() }
+    }
+
+    /** Text nejbližšího <li> (obsahuje i délku), jinak text rodiče odkazu. */
+    private fun containerText(a: Element): String {
+        var node: Element? = a.parent()
+        var depth = 0
+        while (node != null && depth < 4) {
+            if (node.tagName() == "li") return node.text()
+            node = node.parent()
+            depth++
+        }
+        return a.parent()?.text().orEmpty()
+    }
+
+    /** "1 ч 10 мин" -> 70, "5 мин" -> 5, "2 ч" -> 120, jinak null. Hledá se na konci textu. */
+    private fun parseDurationMinutes(text: String): Int? {
+        val tail = text.trim().takeLast(24)
+        val hours = HOURS_REGEX.find(tail)?.groupValues?.get(1)?.toIntOrNull()
+        val minutes = MINUTES_REGEX.find(tail)?.groupValues?.get(1)?.toIntOrNull()
+        if (hours == null && minutes == null) return null
+        return (hours ?: 0) * 60 + (minutes ?: 0)
+    }
 
     private fun absolute(url: String): String {
         val u = url.trim()
