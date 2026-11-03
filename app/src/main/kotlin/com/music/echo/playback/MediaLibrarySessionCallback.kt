@@ -25,6 +25,7 @@ import echo.music.iad1tya.constants.MediaSessionConstants.CommandToggleStartRadi
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.guava.future
@@ -36,34 +37,52 @@ import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
 import javax.inject.Singleton
 
+private data class AgeGroup(val key: String, val label: String, val url: String)
+
+private val AGE_GROUPS = listOf(
+    AgeGroup("2_3", "2–3 roky", DetiOnlineParser.AGE_2_3_URL),
+    AgeGroup("4_5", "4–5 let", DetiOnlineParser.AGE_4_5_URL),
+    AgeGroup("6_7", "6–7 let", DetiOnlineParser.AGE_6_7_URL)
+)
+
+private val DURATION_LABELS = listOf(
+    "Krátké – do 5 minut",
+    "Střední – 5 až 20 minut",
+    "Delší – 20 minut až hodina",
+    "Dlouhé – přes hodinu",
+    "Bez udané délky"
+)
+
+private fun durationBucket(minutes: Int?): Int = when {
+    minutes == null -> 4
+    minutes <= 5 -> 0
+    minutes <= 20 -> 1
+    minutes <= 60 -> 2
+    else -> 3
+}
+
 /**
  * Android Auto / Media3 library callback pro pohádky z deti-online.com.
  *
- * Co je opraveno oproti původní verzi:
- *  1. onConnect: používá DEFAULT_SESSION_AND_LIBRARY_COMMANDS (bez knihovních příkazů
- *     Android Auto nemohl procházet strom -> "doesn't seem to be working").
- *  2. Kořen se dělí do skupin po GROUP_SIZE pohádkách (206 položek najednou + artwork = timeout).
- *  3. Katalog i kapitoly se cachují (netahá se web při každém kliknutí).
- *  4. onAddMediaItems / onSetMediaItems: doplní URI + customCacheKey (MusicService jinak padá na
- *     "No media id") a při spuštění kapitoly dá do fronty všechny kapitoly dané pohádky.
- *  5. onCustomCommand: porovnává s konstantami z MediaSessionConstants, funguje repeat i shuffle.
- *  6. onSearch: hlásí skutečný počet výsledků.
+ * Strom v autě:
+ *   Pohádky Děti Online
+ *    ├─ Pokračovat v poslechu     (jen když existuje historie; položky se přehrají od uložené pozice)
+ *    ├─ 2–3 roky / 4–5 let / 6–7 let
+ *    │    └─ Krátké / Střední / Delší / Dlouhé  (podle délky) -> pohádky -> kapitoly
+ *    └─ Všechny pohádky -> skupiny po 30 -> pohádky -> kapitoly
  *
- * Nově (bod 1 – historie):
- *  7. Průběžné ukládání "pohádka + kapitola + pozice" do DetiHistoryStore.
- *  8. Složka "Pokračovat" v kořeni; klepnutí naváže přesně tam, kde se skončilo.
- *  9. onPlaybackResumption: automatické navázání poslední pohádky (např. po nastartování auta).
- * 10. Cache kapitol má TTL, aby se po čase načetly čerstvé odkazy na mp3.
+ * Historie: každých 15 s během přehrávání, při pauze a při přechodu na další kapitolu se uloží
+ * pohádka + číslo kapitoly + pozice. Dokončená pohádka se z historie odstraní.
  */
 @androidx.annotation.OptIn(UnstableApi::class)
 @Singleton
 class MediaLibrarySessionCallback @Inject constructor(
-    @ApplicationContext private val context: Context,
-    private val history: DetiHistoryStore
+    @ApplicationContext private val context: Context
 ) : MediaLibraryService.MediaLibrarySession.Callback {
 
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     private val detiParser = DetiOnlineParser()
+    private val history = DetiHistoryStore(context)
 
     // Callbacky pro vlastní tlačítka v ovládání přehrávače
     var toggleLike: (() -> Unit)? = null
@@ -71,113 +90,122 @@ class MediaLibrarySessionCallback @Inject constructor(
     var toggleLibrary: (() -> Unit)? = null
     var onAutomotiveConnected: (() -> Unit)? = null
 
-    /**
-     * Vrací AKTUÁLNÍ přehrávač. MusicService při crossfade vyměňuje instanci `player`,
-     * takže si ji nelze zapamatovat jednou provždy.
-     */
-    @Volatile var playerProvider: (() -> Player?)? = null
-
     // ---- Cache ----------------------------------------------------------------------------
 
-    @Volatile private var catalogCache: List<DetiTaleItem> = emptyList()
-    @Volatile private var catalogCacheTs = 0L
+    private class CachedList(val items: List<DetiTaleItem>, val ts: Long)
 
     private class TaleData(
         val browseItems: List<MediaItem>, // do seznamu v autě (bez artworku -> rychlé)
         val playItems: List<MediaItem>,   // do fronty přehrávače (s artworkem)
-        val loadedAt: Long = SystemClock.elapsedRealtime()
+        val ts: Long
     )
 
-    private val taleCache = ConcurrentHashMap<String, TaleData>()
-    private val trackItems = ConcurrentHashMap<String, MediaItem>()   // trackId -> playItem
-    private val trackToTale = ConcurrentHashMap<String, String>()     // trackId -> URL pohádky
+    private val listCache = ConcurrentHashMap<String, CachedList>()          // URL katalogu -> pohádky
+    private val taleCache = ConcurrentHashMap<String, TaleData>()            // URL pohádky -> kapitoly
+    private val trackItems = ConcurrentHashMap<String, MediaItem>()          // trackId -> playItem
+    private val trackToTale = ConcurrentHashMap<String, String>()            // trackId -> URL pohádky
 
     companion object {
         const val ROOT_ID = "ROOT_DETI_ONLINE"
-        const val CONTINUE_ID = "CONTINUE_DETI"
-        private const val GROUP_PREFIX = "GROUP_DETI_"
-        private const val RESUME_PREFIX = "RESUME_DETI_"
+        private const val RESUME_ID = "RESUME_DETI"
+        private const val ALL_ID = "ALL_DETI"
+        private const val AGE_PREFIX = "AGE_DETI|"       // AGE_DETI|4_5
+        private const val DUR_PREFIX = "DUR_DETI|"       // DUR_DETI|4_5|1
+        private const val CHUNK_PREFIX = "CHUNK_DETI|"   // CHUNK_DETI|<nodeId>|<index>
+        private const val RESUME_ITEM_PREFIX = "RESUME::" // RESUME::<URL pohádky> (přehratelné)
+
+        private const val EXTRA_TALE_ID = "deti_tale_id"
+        private const val EXTRA_TALE_TITLE = "deti_tale_title"
+        private const val EXTRA_TALE_ARTWORK = "deti_tale_artwork"
+        private const val EXTRA_TRACK_INDEX = "deti_track_index"
+
         private const val GROUP_SIZE = 30
         private const val SEARCH_LIMIT = 30
-        private const val CATALOG_TTL_MS = 30 * 60_000L
-        private const val TALE_TTL_MS = 60 * 60_000L          // odkazy na mp3 po hodině obnovit
-        private const val PROGRESS_SAVE_INTERVAL_MS = 10_000L // ukládání pozice za chodu
-        private const val RESUME_REWIND_MS = 3_000L           // navázat o pár vteřin dříve
-        private const val EXTRA_TALE_URL = "deti_tale_url"
-        private const val EXTRA_CHAPTER_INDEX = "deti_chapter_index"
+        private const val LIST_TTL_MS = 30 * 60_000L
+        private const val TALE_TTL_MS = 6 * 60 * 60_000L
+        private const val SAVE_INTERVAL_MS = 15_000L
         private const val TAG = "DetiLibrary"
     }
 
-    init {
-        // Pravidelné ukládání pozice, dokud se něco přehrává
-        scope.launch {
+    // ---- Sledování přehrávání (historie) ----------------------------------------------------
+
+    private var trackedPlayer: Player? = null
+    private var tickerJob: Job? = null
+
+    private val trackerListener = object : Player.Listener {
+        override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+            saveProgress()
+        }
+
+        override fun onIsPlayingChanged(isPlaying: Boolean) {
+            if (isPlaying) startTicker() else {
+                stopTicker()
+                saveProgress()
+            }
+        }
+
+        override fun onPlaybackStateChanged(playbackState: Int) {
+            if (playbackState == Player.STATE_ENDED) onTaleFinished()
+        }
+    }
+
+    private fun attachTracker(player: Player) {
+        if (trackedPlayer === player) return
+        try {
+            trackedPlayer?.removeListener(trackerListener)
+        } catch (e: Exception) {
+            Timber.tag(TAG).w(e, "removeListener selhalo")
+        }
+        trackedPlayer = player
+        player.addListener(trackerListener)
+    }
+
+    private fun startTicker() {
+        tickerJob?.cancel()
+        tickerJob = scope.launch {
             while (isActive) {
-                delay(PROGRESS_SAVE_INTERVAL_MS)
-                val player = playerProvider?.invoke()
-                if (player != null && player.isPlaying) saveProgress()
+                delay(SAVE_INTERVAL_MS)
+                saveProgress()
             }
         }
     }
 
-    // ---- Historie -------------------------------------------------------------------------
+    private fun stopTicker() {
+        tickerJob?.cancel()
+        tickerJob = null
+    }
 
-    /**
-     * Uloží aktuální pohádku, kapitolu a pozici. Volá se ze smyčky výše a z MusicService
-     * (pauza, konec přehrávání, onDestroy). Položky, které nejsou z deti-online (YouTube),
-     * se ignorují. Musí se volat na hlavním vlákně.
-     */
-    fun saveProgress() {
+    private fun saveProgress() {
+        val player = trackedPlayer ?: return
+        if (player.playbackState == Player.STATE_ENDED) return
+        val item = player.currentMediaItem ?: return
+        val extras = item.mediaMetadata.extras ?: return
+        val taleId = extras.getString(EXTRA_TALE_ID) ?: return
+        val index = extras.getInt(EXTRA_TRACK_INDEX, -1)
+        if (index < 0) return
         try {
-            val player = playerProvider?.invoke() ?: return
-            val item = player.currentMediaItem ?: return
-            val extras = item.mediaMetadata.extras ?: return
-            val taleUrl = extras.getString(EXTRA_TALE_URL) ?: return
-            val index = extras.getInt(EXTRA_CHAPTER_INDEX, -1)
-            if (index < 0) return
-
-            val chapterCount = taleCache[taleUrl]?.playItems?.size ?: player.mediaItemCount
-
-            // Dohráno do konce -> pohádka zmizí z "Pokračovat"
-            if (player.playbackState == Player.STATE_ENDED && index >= chapterCount - 1) {
-                history.remove(taleUrl)
-                return
-            }
-
-            val meta = item.mediaMetadata
-            history.save(
+            history.upsert(
                 DetiHistoryEntry(
-                    taleUrl = taleUrl,
-                    taleTitle = meta.albumTitle?.toString().orEmpty(),
-                    artworkUrl = meta.artworkUri?.toString(),
-                    chapterIndex = index,
-                    chapterTitle = meta.title?.toString().orEmpty(),
+                    taleId = taleId,
+                    title = extras.getString(EXTRA_TALE_TITLE).orEmpty(),
+                    artworkUrl = extras.getString(EXTRA_TALE_ARTWORK)?.ifEmpty { null },
+                    trackIndex = index,
+                    trackTitle = item.mediaMetadata.title?.toString(),
                     positionMs = player.currentPosition.coerceAtLeast(0L),
                     updatedAt = System.currentTimeMillis()
                 )
             )
-        } catch (e: CancellationException) {
-            throw e
         } catch (e: Exception) {
-            Timber.tag(TAG).w(e, "saveProgress selhalo")
+            Timber.tag(TAG).w(e, "Uložení historie selhalo")
         }
     }
 
-    /** Fronta celé pohádky + kapitola a pozice, kde se skončilo. */
-    private suspend fun resumeTale(taleUrl: String): MediaSession.MediaItemsWithStartPosition? {
-        val entry = history.get(taleUrl) ?: return null
-        val queue = loadTale(taleUrl)?.playItems ?: return null
-
-        fun titleAt(i: Int) = queue.getOrNull(i)?.mediaMetadata?.title?.toString()
-
-        // Kapitola se hledá podle pořadí; změnil-li se seznam, podle názvu
-        val matched = when {
-            titleAt(entry.chapterIndex) == entry.chapterTitle -> entry.chapterIndex
-            else -> queue.indices.firstOrNull { titleAt(it) == entry.chapterTitle } ?: -1
-        }
-        val index = if (matched >= 0) matched else entry.chapterIndex.coerceIn(0, queue.lastIndex)
-        val position = if (matched >= 0) (entry.positionMs - RESUME_REWIND_MS).coerceAtLeast(0L) else 0L
-
-        return MediaSession.MediaItemsWithStartPosition(queue, index, position)
+    /** Přehrála se poslední kapitola -> pohádka je hotová, vyhodíme ji z "Pokračovat". */
+    private fun onTaleFinished() {
+        stopTicker()
+        val taleId = trackedPlayer?.currentMediaItem?.mediaMetadata?.extras?.getString(EXTRA_TALE_ID)
+            ?: return
+        history.remove(taleId)
     }
 
     // ---- Připojení ------------------------------------------------------------------------
@@ -190,6 +218,8 @@ class MediaLibrarySessionCallback @Inject constructor(
         if (controller.connectionHints.getBoolean("androidx.media3.session.AUTO", false)) {
             onAutomotiveConnected?.invoke()
         }
+
+        attachTracker(session.player)
 
         // DŮLEŽITÉ: SESSION_AND_LIBRARY, jinak Android Auto nesmí procházet knihovnu!
         val sessionCommands = MediaSession.ConnectionResult.DEFAULT_SESSION_AND_LIBRARY_COMMANDS
@@ -250,12 +280,6 @@ class MediaLibrarySessionCallback @Inject constructor(
         return Futures.immediateFuture(LibraryResult.ofItem(rootItem(), params))
     }
 
-    /**
-     * - ROOT          -> "Pokračovat" (je-li co) + skupiny pohádek (nebo rovnou pohádky)
-     * - CONTINUE_ID   -> rozposlouchané pohádky (klepnutí = navázání)
-     * - GROUP_DETI_n  -> pohádky z dané skupiny
-     * - URL pohádky   -> kapitoly (přímé MP3)
-     */
     override fun onGetChildren(
         session: MediaLibraryService.MediaLibrarySession,
         browser: MediaSession.ControllerInfo,
@@ -268,8 +292,10 @@ class MediaLibrarySessionCallback @Inject constructor(
             val items: List<MediaItem> = try {
                 when {
                     parentId == ROOT_ID -> rootChildren()
-                    parentId == CONTINUE_ID -> continueChildren()
-                    parentId.startsWith(GROUP_PREFIX) -> groupChildren(parentId)
+                    parentId == RESUME_ID -> history.getAll().map { resumeItem(it) }
+                    parentId.startsWith(CHUNK_PREFIX) -> chunkChildren(parentId)
+                    parentId.startsWith(AGE_PREFIX) -> ageChildren(parentId.removePrefix(AGE_PREFIX))
+                    parentId == ALL_ID || parentId.startsWith(DUR_PREFIX) -> listNodeChildren(parentId)
                     else -> loadTale(parentId)?.browseItems ?: emptyList()
                 }
             } catch (e: CancellationException) {
@@ -287,13 +313,12 @@ class MediaLibrarySessionCallback @Inject constructor(
         browser: MediaSession.ControllerInfo,
         mediaId: String
     ): ListenableFuture<LibraryResult<MediaItem>> {
-        val story = catalogCache.firstOrNull { it.id == mediaId }
+        val story = findTale(mediaId)
         val item: MediaItem? = when {
             mediaId == ROOT_ID -> rootItem()
-            mediaId == CONTINUE_ID -> continueFolderItem()
-            mediaId.startsWith(RESUME_PREFIX) ->
-                history.get(mediaId.removePrefix(RESUME_PREFIX))?.let { resumeItem(it) }
             trackItems.containsKey(mediaId) -> trackItems[mediaId]
+            mediaId.startsWith(RESUME_ITEM_PREFIX) ->
+                history.get(mediaId.removePrefix(RESUME_ITEM_PREFIX))?.let { resumeItem(it) }
             story != null -> storyItem(story)
             mediaId.startsWith("http://") || mediaId.startsWith("https://") ->
                 resolvePlayable(MediaItem.Builder().setMediaId(mediaId).build())
@@ -313,15 +338,7 @@ class MediaLibrarySessionCallback @Inject constructor(
         controller: MediaSession.ControllerInfo,
         mediaItems: MutableList<MediaItem>
     ): ListenableFuture<MutableList<MediaItem>> {
-        return scope.future {
-            mediaItems.flatMap { item ->
-                if (item.mediaId.startsWith(RESUME_PREFIX)) {
-                    loadTale(item.mediaId.removePrefix(RESUME_PREFIX))?.playItems ?: emptyList()
-                } else {
-                    listOf(resolvePlayable(item))
-                }
-            }.toMutableList()
-        }
+        return Futures.immediateFuture(mediaItems.map { resolvePlayable(it) }.toMutableList())
     }
 
     override fun onSetMediaItems(
@@ -332,15 +349,24 @@ class MediaLibrarySessionCallback @Inject constructor(
         startPositionMs: Long
     ): ListenableFuture<MediaSession.MediaItemsWithStartPosition> {
         return scope.future {
-            // Klepnutí na pohádku ve složce "Pokračovat" -> kapitola + pozice z historie
             val first = mediaItems.firstOrNull()
-            if (mediaItems.size == 1 && first != null && first.mediaId.startsWith(RESUME_PREFIX)) {
-                resumeTale(first.mediaId.removePrefix(RESUME_PREFIX))?.let { return@future it }
+
+            // 1) "Pokračovat" -> celá pohádka od uložené kapitoly a pozice
+            if (mediaItems.size == 1 && first != null && first.mediaId.startsWith(RESUME_ITEM_PREFIX)) {
+                val resumed = try {
+                    resolveResume(first.mediaId.removePrefix(RESUME_ITEM_PREFIX))
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    Timber.tag(TAG).e(e, "Pokračování selhalo")
+                    null
+                }
+                if (resumed != null) return@future resumed
             }
 
             val resolved = mediaItems.map { resolvePlayable(it) }
 
-            // Android Auto pošle jednu kapitolu -> do fronty dáme celou pohádku od této kapitoly
+            // 2) Jedna kapitola -> do fronty celá pohádka od této kapitoly
             if (resolved.size == 1) {
                 val id = resolved[0].mediaId
                 val queue = trackToTale[id]?.let { taleCache[it]?.playItems }
@@ -353,18 +379,20 @@ class MediaLibrarySessionCallback @Inject constructor(
         }
     }
 
-    /**
-     * Automatické navázání (po nastartování auta, stisk Play na ovladači, Bluetooth...).
-     * Naváže poslední rozposlouchanou pohádku. Selže-li future, Media3 nic nespustí.
-     */
-    override fun onPlaybackResumption(
-        mediaSession: MediaSession,
-        controller: MediaSession.ControllerInfo
-    ): ListenableFuture<MediaSession.MediaItemsWithStartPosition> {
-        return scope.future {
-            val last = history.last() ?: throw UnsupportedOperationException("Nic k navázání")
-            resumeTale(last.taleUrl) ?: throw UnsupportedOperationException("Pohádku se nepodařilo načíst")
+    private suspend fun resolveResume(taleId: String): MediaSession.MediaItemsWithStartPosition? {
+        val entry = history.get(taleId) ?: return null
+        val tale = loadTale(taleId, entry.title, entry.artworkUrl) ?: return null
+        val items = tale.playItems
+        if (items.isEmpty()) return null
+
+        var index = entry.trackIndex.coerceIn(0, items.size - 1)
+        // Kdyby se seznam kapitol na webu změnil, zkusíme kapitolu najít podle názvu
+        val savedTitle = entry.trackTitle
+        if (savedTitle != null && items[index].mediaMetadata.title?.toString() != savedTitle) {
+            val byTitle = items.indexOfFirst { it.mediaMetadata.title?.toString() == savedTitle }
+            if (byTitle >= 0) index = byTitle
         }
+        return MediaSession.MediaItemsWithStartPosition(items, index, entry.positionMs)
     }
 
     // ---- Vyhledávání ----------------------------------------------------------------------
@@ -411,129 +439,144 @@ class MediaLibrarySessionCallback @Inject constructor(
         }
     }
 
-    // ---- Načítání dat ---------------------------------------------------------------------
-
-    private suspend fun loadCatalog(): List<DetiTaleItem> {
-        val cached = catalogCache
-        if (cached.isNotEmpty() && SystemClock.elapsedRealtime() - catalogCacheTs < CATALOG_TTL_MS) {
-            return cached
-        }
-        val fresh = detiParser.getCatalog()
-        if (fresh.isNotEmpty()) {
-            catalogCache = fresh
-            catalogCacheTs = SystemClock.elapsedRealtime()
-            return fresh
-        }
-        return cached // web nedostupný -> raději stará data než nic
-    }
-
     private suspend fun searchCatalog(query: String): List<DetiTaleItem> {
         if (query.isBlank()) return emptyList()
-        return loadCatalog()
+        return loadList(DetiOnlineParser.DEFAULT_CATALOG_URL)
             .filter { it.title.contains(query, ignoreCase = true) }
             .take(SEARCH_LIMIT)
     }
 
-    private suspend fun rootChildren(): List<MediaItem> {
-        val resume = if (history.getAll().isNotEmpty()) listOf(continueFolderItem()) else emptyList()
-        val catalog = loadCatalog()
-        val tales = if (catalog.size <= GROUP_SIZE) {
-            catalog.map { storyItem(it) }
-        } else {
-            catalog.chunked(GROUP_SIZE).mapIndexed { index, chunk -> groupItem(index, chunk.size) }
+    // ---- Načítání dat ---------------------------------------------------------------------
+
+    private suspend fun loadList(url: String): List<DetiTaleItem> {
+        val cached = listCache[url]
+        if (cached != null && SystemClock.elapsedRealtime() - cached.ts < LIST_TTL_MS) {
+            return cached.items
         }
-        return resume + tales
+        val fresh = detiParser.getCatalog(url)
+        if (fresh.isNotEmpty()) {
+            listCache[url] = CachedList(fresh, SystemClock.elapsedRealtime())
+            return fresh
+        }
+        return cached?.items ?: emptyList() // web nedostupný -> raději stará data než nic
     }
 
-    private fun continueChildren(): List<MediaItem> = history.getAll().map { resumeItem(it) }
+    private fun findTale(id: String): DetiTaleItem? {
+        for (cached in listCache.values) {
+            cached.items.firstOrNull { it.id == id }?.let { return it }
+        }
+        return null
+    }
 
-    private suspend fun groupChildren(groupId: String): List<MediaItem> {
-        val index = groupId.removePrefix(GROUP_PREFIX).toIntOrNull() ?: return emptyList()
-        return loadCatalog()
+    private suspend fun loadTale(
+        taleId: String,
+        titleHint: String? = null,
+        artworkHint: String? = null
+    ): TaleData? {
+        val cached = taleCache[taleId]
+        if (cached != null && SystemClock.elapsedRealtime() - cached.ts < TALE_TTL_MS) return cached
+
+        val tracks = detiParser.getTracks(taleId)
+        if (tracks.isEmpty()) return cached
+
+        val tale = findTale(taleId)
+        val taleTitle = tale?.title ?: titleHint
+        val artworkUrl = (tale?.artworkUrl ?: artworkHint)?.takeIf { it.isNotBlank() }
+
+        val browse = tracks.mapIndexed { i, t -> buildTrackItem(t, taleId, taleTitle, artworkUrl, i, false) }
+        val play = tracks.mapIndexed { i, t -> buildTrackItem(t, taleId, taleTitle, artworkUrl, i, true) }
+        play.forEach {
+            trackItems[it.mediaId] = it
+            trackToTale[it.mediaId] = taleId
+        }
+        return TaleData(browse, play, SystemClock.elapsedRealtime()).also { taleCache[taleId] = it }
+    }
+
+    // ---- Uzly stromu ----------------------------------------------------------------------
+
+    private fun rootChildren(): List<MediaItem> {
+        val items = mutableListOf<MediaItem>()
+        if (history.getAll().isNotEmpty()) {
+            items.add(folderItem(RESUME_ID, "Pokračovat v poslechu"))
+        }
+        for (group in AGE_GROUPS) {
+            items.add(folderItem("$AGE_PREFIX${group.key}", group.label))
+        }
+        items.add(folderItem(ALL_ID, "Všechny pohádky"))
+        return items
+    }
+
+    /** Věková kategorie -> složky podle délky (nebo rovnou pohádky, když se délku nepodařilo načíst). */
+    private suspend fun ageChildren(key: String): List<MediaItem> {
+        val group = AGE_GROUPS.firstOrNull { it.key == key } ?: return emptyList()
+        val list = loadList(group.url)
+        if (list.isEmpty()) return emptyList()
+
+        if (list.count { it.durationMin != null } < list.size / 2) {
+            return listNodeChildren("$AGE_PREFIX$key")
+        }
+        return DURATION_LABELS.indices.mapNotNull { bucket ->
+            val count = list.count { durationBucket(it.durationMin) == bucket }
+            if (count == 0) null
+            else folderItem("$DUR_PREFIX$key|$bucket", "${DURATION_LABELS[bucket]} · $count")
+        }
+    }
+
+    /** Úplný seznam pohádek pro uzel (Všechny / věk / věk+délka). */
+    private suspend fun listFor(nodeId: String): List<DetiTaleItem> {
+        if (nodeId == ALL_ID) return loadList(DetiOnlineParser.DEFAULT_CATALOG_URL)
+        if (nodeId.startsWith(AGE_PREFIX)) {
+            val group = AGE_GROUPS.firstOrNull { it.key == nodeId.removePrefix(AGE_PREFIX) }
+                ?: return emptyList()
+            return loadList(group.url)
+        }
+        if (nodeId.startsWith(DUR_PREFIX)) {
+            val parts = nodeId.removePrefix(DUR_PREFIX).split("|")
+            val group = AGE_GROUPS.firstOrNull { it.key == parts.getOrNull(0) } ?: return emptyList()
+            val bucket = parts.getOrNull(1)?.toIntOrNull() ?: return emptyList()
+            return loadList(group.url).filter { durationBucket(it.durationMin) == bucket }
+        }
+        return emptyList()
+    }
+
+    /** Je pohádek víc než GROUP_SIZE -> rozdělí je do složek "Pohádky 1–30" apod. */
+    private suspend fun listNodeChildren(nodeId: String): List<MediaItem> {
+        val list = listFor(nodeId)
+        if (list.size <= GROUP_SIZE) return list.map { storyItem(it) }
+        return list.chunked(GROUP_SIZE).mapIndexed { index, chunk ->
+            val from = index * GROUP_SIZE + 1
+            val to = from + chunk.size - 1
+            folderItem("$CHUNK_PREFIX$nodeId|$index", "Pohádky $from–$to")
+        }
+    }
+
+    private suspend fun chunkChildren(chunkId: String): List<MediaItem> {
+        val rest = chunkId.removePrefix(CHUNK_PREFIX)
+        val sep = rest.lastIndexOf('|')
+        if (sep < 0) return emptyList()
+        val nodeId = rest.substring(0, sep)
+        val index = rest.substring(sep + 1).toIntOrNull() ?: return emptyList()
+        return listFor(nodeId)
             .drop(index * GROUP_SIZE)
             .take(GROUP_SIZE)
             .map { storyItem(it) }
     }
 
-    private suspend fun loadTale(taleId: String): TaleData? {
-        val cached = taleCache[taleId]
-        if (cached != null && SystemClock.elapsedRealtime() - cached.loadedAt < TALE_TTL_MS) {
-            return cached
-        }
-
-        val tracks = detiParser.getTracks(taleId)
-        if (tracks.isEmpty()) return cached // web nedostupný -> raději stará data než nic
-
-        val tale = catalogCache.firstOrNull { it.id == taleId }
-        val taleTitle = tale?.title ?: history.get(taleId)?.taleTitle
-        val artworkUrl = tale?.artworkUrl ?: history.get(taleId)?.artworkUrl
-        val artwork = artworkUrl?.takeIf { it.isNotBlank() }?.let { Uri.parse(it) }
-
-        val browse = tracks.mapIndexed { i, t -> buildTrackItem(t, taleId, i, taleTitle, null) }
-        val play = tracks.mapIndexed { i, t -> buildTrackItem(t, taleId, i, taleTitle, artwork) }
-        play.forEach {
-            trackItems[it.mediaId] = it
-            trackToTale[it.mediaId] = taleId
-        }
-
-        return TaleData(browse, play).also { taleCache[taleId] = it }
-    }
-
     // ---- Stavba MediaItemů ----------------------------------------------------------------
 
-    private fun rootItem(): MediaItem =
+    private fun rootItem(): MediaItem = folderItem(ROOT_ID, "Pohádky Děti Online")
+
+    private fun folderItem(id: String, title: String): MediaItem =
         MediaItem.Builder()
-            .setMediaId(ROOT_ID)
+            .setMediaId(id)
             .setMediaMetadata(
                 MediaMetadata.Builder()
-                    .setTitle("Pohádky Děti Online")
+                    .setTitle(title)
                     .setIsBrowsable(true)
                     .setIsPlayable(false)
                     .build()
             )
             .build()
-
-    private fun continueFolderItem(): MediaItem =
-        MediaItem.Builder()
-            .setMediaId(CONTINUE_ID)
-            .setMediaMetadata(
-                MediaMetadata.Builder()
-                    .setTitle("Pokračovat")
-                    .setIsBrowsable(true)
-                    .setIsPlayable(false)
-                    .build()
-            )
-            .build()
-
-    /** Položka ve složce "Pokračovat": přehratelná, po klepnutí naváže v uložené pozici. */
-    private fun resumeItem(entry: DetiHistoryEntry): MediaItem =
-        MediaItem.Builder()
-            .setMediaId("$RESUME_PREFIX${entry.taleUrl}")
-            .setMediaMetadata(
-                MediaMetadata.Builder()
-                    .setTitle(entry.taleTitle.ifEmpty { entry.chapterTitle })
-                    .setSubtitle("Kapitola ${entry.chapterIndex + 1} · ${formatPosition(entry.positionMs)}")
-                    .setArtworkUri(entry.artworkUrl?.takeIf { it.isNotBlank() }?.let { Uri.parse(it) })
-                    .setIsBrowsable(false)
-                    .setIsPlayable(true)
-                    .build()
-            )
-            .build()
-
-    private fun groupItem(index: Int, count: Int): MediaItem {
-        val from = index * GROUP_SIZE + 1
-        val to = from + count - 1
-        return MediaItem.Builder()
-            .setMediaId("$GROUP_PREFIX$index")
-            .setMediaMetadata(
-                MediaMetadata.Builder()
-                    .setTitle("Pohádky $from–$to")
-                    .setIsBrowsable(true)
-                    .setIsPlayable(false)
-                    .build()
-            )
-            .build()
-    }
 
     private fun storyItem(story: DetiTaleItem): MediaItem =
         MediaItem.Builder()
@@ -548,19 +591,37 @@ class MediaLibrarySessionCallback @Inject constructor(
             )
             .build()
 
+    /** Položka v "Pokračovat": přehratelná, po klepnutí naváže tam, kde se skončilo. */
+    private fun resumeItem(entry: DetiHistoryEntry): MediaItem =
+        MediaItem.Builder()
+            .setMediaId("$RESUME_ITEM_PREFIX${entry.taleId}")
+            .setMediaMetadata(
+                MediaMetadata.Builder()
+                    .setTitle(entry.title.ifEmpty { "Pohádka" })
+                    .setSubtitle("Kapitola ${entry.trackIndex + 1} · ${formatTime(entry.positionMs)}")
+                    .setArtworkUri(entry.artworkUrl?.takeIf { it.isNotBlank() }?.let { Uri.parse(it) })
+                    .setIsBrowsable(false)
+                    .setIsPlayable(true)
+                    .build()
+            )
+            .build()
+
     private fun buildTrackItem(
         track: DetiTaleItem,
-        taleUrl: String,
-        chapterIndex: Int,
+        taleId: String,
         taleTitle: String?,
-        artwork: Uri?
+        taleArtworkUrl: String?,
+        index: Int,
+        withArtwork: Boolean
     ): MediaItem {
         val url = track.mediaUri ?: track.id
-        // Extras: podle nich ví saveProgress(), ke které pohádce a kapitole položka patří
         val extras = Bundle().apply {
-            putString(EXTRA_TALE_URL, taleUrl)
-            putInt(EXTRA_CHAPTER_INDEX, chapterIndex)
+            putString(EXTRA_TALE_ID, taleId)
+            putString(EXTRA_TALE_TITLE, taleTitle.orEmpty())
+            putString(EXTRA_TALE_ARTWORK, taleArtworkUrl.orEmpty())
+            putInt(EXTRA_TRACK_INDEX, index)
         }
+        val artwork = if (withArtwork) taleArtworkUrl?.let { Uri.parse(it) } else null
         return MediaItem.Builder()
             .setMediaId(track.id)
             .setUri(url)
@@ -593,13 +654,13 @@ class MediaLibrarySessionCallback @Inject constructor(
 
     // ---- Pomocné --------------------------------------------------------------------------
 
-    private fun formatPosition(ms: Long): String {
-        val totalSec = (ms / 1000).coerceAtLeast(0L)
-        val h = totalSec / 3600
-        val m = (totalSec % 3600) / 60
-        val s = totalSec % 60
-        return if (h > 0) String.format(Locale.ROOT, "%d:%02d:%02d", h, m, s)
-        else String.format(Locale.ROOT, "%d:%02d", m, s)
+    private fun formatTime(ms: Long): String {
+        val total = (ms / 1000).coerceAtLeast(0L)
+        val h = total / 3600
+        val m = (total % 3600) / 60
+        val s = total % 60
+        return if (h > 0) String.format(Locale.US, "%d:%02d:%02d", h, m, s)
+        else String.format(Locale.US, "%d:%02d", m, s)
     }
 
     private fun <T> List<T>.paged(page: Int, pageSize: Int): List<T> {
