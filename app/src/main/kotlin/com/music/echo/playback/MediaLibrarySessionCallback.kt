@@ -1,6 +1,12 @@
 package echo.music.iad1tya.playback
 
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.RectF
+import android.graphics.Typeface
 import android.net.Uri
 import android.os.Bundle
 import android.os.Looper
@@ -25,55 +31,72 @@ import echo.music.iad1tya.constants.MediaSessionConstants.CommandToggleShuffle
 import echo.music.iad1tya.constants.MediaSessionConstants.CommandToggleStartRadio
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.guava.future
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import timber.log.Timber
+import java.io.ByteArrayOutputStream
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
 import javax.inject.Singleton
 
-private data class AgeGroup(val key: String, val label: String, val url: String)
-
-private val AGE_GROUPS = listOf(
-    AgeGroup("2_3", "2–3 roky", DetiOnlineParser.AGE_2_3_URL),
-    AgeGroup("4_5", "4–5 let", DetiOnlineParser.AGE_4_5_URL),
-    AgeGroup("6_7", "6–7 let", DetiOnlineParser.AGE_6_7_URL)
+private data class AgeGroup(
+    val key: String,
+    val label: String,
+    val url: String,
+    val chipBig: String,
+    val chipSub: String,
+    val color: Int
 )
 
-private val DURATION_LABELS = listOf(
-    "Krátké – do 5 minut",
-    "Střední – 5 až 20 minut",
-    "Delší – 20 minut až hodina",
-    "Dlouhé – přes hodinu",
-    "Bez udané délky"
+private val CHIP_COLORS = intArrayOf(
+    0xFF5C6BC0.toInt(), 0xFF26A69A.toInt(), 0xFFEF5350.toInt(),
+    0xFFFFA726.toInt(), 0xFF66BB6A.toInt(), 0xFFAB47BC.toInt()
 )
 
-private fun durationBucket(minutes: Int?): Int = when {
-    minutes == null -> 4
-    minutes <= 5 -> 0
-    minutes <= 20 -> 1
-    minutes <= 60 -> 2
-    else -> 3
+/** Záloha, kdyby se věkové filtry z webu nepodařilo načíst. */
+private val FALLBACK_AGE_LINKS = listOf(
+    DetiAgeLink("dlya-malyshey-2-3-let", DetiOnlineParser.AGE_2_3_URL, 2, 3),
+    DetiAgeLink("dlya-detey-4-5-let", DetiOnlineParser.AGE_4_5_URL, 4, 5),
+    DetiAgeLink("dlya-detey-6-7-let", DetiOnlineParser.AGE_6_7_URL, 6, 7)
+)
+
+private fun ageGroupOf(link: DetiAgeLink, index: Int): AgeGroup {
+    val max = link.maxAge
+    val big: String
+    val sub: String
+    val label: String
+    when {
+        max == null && link.minAge == 0 -> { big = "0+"; sub = "nejmenší"; label = "Nejmenší (0+)" }
+        max == null -> { big = "${link.minAge}+"; sub = "let"; label = "${link.minAge}+ let" }
+        else -> {
+            big = "${link.minAge}–$max"
+            sub = if (max <= 3) "roky" else "let"
+            label = "$big $sub"
+        }
+    }
+    return AgeGroup(link.slug, label, link.url, big, sub, CHIP_COLORS[index % CHIP_COLORS.size])
 }
 
 /**
- * Android Auto / Media3 library callback pro pohádky z deti-online.com.
+ * Android Auto / Media3 library callback pro pohádky z deti-online.com. Kopíruje uspořádání webu:
  *
- * Strom v autě:
- *   Pohádky Děti Online
- *    ├─ Pokračovat v poslechu     (jen když existuje historie; položky se přehrají od uložené pozice)
- *    ├─ 2–3 roky / 4–5 let / 6–7 let
- *    │    └─ Krátké / Střední / Delší / Dlouhé  (podle délky) -> pohádky -> kapitoly
- *    └─ Všechny pohádky -> skupiny po 30 -> pohádky -> kapitoly
+ *   Úvodní obrazovka (dlaždice):
+ *     [Pokračovat v poslechu]  rozposlouchané pohádky (jen když existují)
+ *     [Podle věku]             0+ / 2–3 / 4–5 / 6–7 / 8–9 / 10+  (filtry z webu)
+ *     [Top pohádky]            nejoblíbenější pohádky + "Další pohádky"
+ *   Věk -> Top pohádky pro daný věk (+ "Další pohádky")
+ *   Pohádka -> kapitoly (seznam)
  *
- * Historie: každých 15 s během přehrávání, při pauze a při přechodu na další kapitolu se uloží
- * pohádka + číslo kapitoly + pozice. Dokončená pohádka se z historie odstraní.
+ * Historie: každých 15 s přehrávání, při pauze a při přechodu na další kapitolu se uloží
+ * pohádka + kapitola + pozice. Dokončená pohádka se z historie odstraní.
  */
 @androidx.annotation.OptIn(UnstableApi::class)
 @Singleton
@@ -96,7 +119,11 @@ class MediaLibrarySessionCallback @Inject constructor(
 
     // ---- Cache ----------------------------------------------------------------------------
 
-    private class CachedList(val items: List<DetiTaleItem>, val ts: Long)
+    private class CachedPage(
+        val items: List<DetiTaleItem>,
+        val ageLinks: List<DetiAgeLink>,
+        val ts: Long
+    )
 
     private class TaleData(
         val browseItems: List<MediaItem>, // do seznamu v autě (bez artworku -> rychlé)
@@ -104,18 +131,20 @@ class MediaLibrarySessionCallback @Inject constructor(
         val ts: Long
     )
 
-    private val listCache = ConcurrentHashMap<String, CachedList>()          // URL katalogu -> pohádky
-    private val taleCache = ConcurrentHashMap<String, TaleData>()            // URL pohádky -> kapitoly
-    private val trackItems = ConcurrentHashMap<String, MediaItem>()          // trackId -> playItem
-    private val trackToTale = ConcurrentHashMap<String, String>()            // trackId -> URL pohádky
+    private val listCache = ConcurrentHashMap<String, CachedPage>()               // URL stránky -> pohádky
+    private val inFlight = ConcurrentHashMap<String, Deferred<CachedPage?>>()     // běžící stahování
+    private val taleCache = ConcurrentHashMap<String, TaleData>()                 // URL pohádky -> kapitoly
+    private val trackItems = ConcurrentHashMap<String, MediaItem>()               // trackId -> playItem
+    private val trackToTale = ConcurrentHashMap<String, String>()                 // trackId -> URL pohádky
+    private val chipCache = ConcurrentHashMap<String, ByteArray>()                // vygenerované obrázky věků
 
     companion object {
         const val ROOT_ID = "ROOT_DETI_ONLINE"
         private const val RESUME_ID = "RESUME_DETI"
-        private const val ALL_ID = "ALL_DETI"
-        private const val AGE_PREFIX = "AGE_DETI|"       // AGE_DETI|4_5
-        private const val DUR_PREFIX = "DUR_DETI|"       // DUR_DETI|4_5|1
-        private const val CHUNK_PREFIX = "CHUNK_DETI|"   // CHUNK_DETI|<nodeId>|<index>
+        private const val TOP_ID = "TOP_DETI"
+        private const val AGE_PREFIX = "AGE_DETI|"        // AGE_DETI|<slug>
+        private const val MORE_PREFIX = "MORE_DETI|"      // MORE_DETI|<nodeId>
+        private const val CHUNK_PREFIX = "CHUNK_DETI|"    // CHUNK_DETI|<nodeId>|<index>
         private const val RESUME_ITEM_PREFIX = "RESUME::" // RESUME::<URL pohádky> (přehratelné)
 
         private const val EXTRA_TALE_ID = "deti_tale_id"
@@ -123,12 +152,25 @@ class MediaLibrarySessionCallback @Inject constructor(
         private const val EXTRA_TALE_ARTWORK = "deti_tale_artwork"
         private const val EXTRA_TRACK_INDEX = "deti_track_index"
 
+        private const val GROUP_RESUME = "Pokračovat v poslechu"
+        private const val GROUP_AGE = "Podle věku"
+        private const val GROUP_TOP = "Top pohádky"
+
         private const val GROUP_SIZE = 30
+        private const val MAX_RESUME_TILES = 4
         private const val SEARCH_LIMIT = 30
         private const val LIST_TTL_MS = 30 * 60_000L
         private const val TALE_TTL_MS = 6 * 60 * 60_000L
         private const val SAVE_INTERVAL_MS = 15_000L
         private const val TAG = "DetiLibrary"
+
+        // Android Auto "content style" (dlaždice vs. seznam, nadpisy skupin)
+        private const val CONTENT_STYLE_SUPPORTED = "android.media.browse.CONTENT_STYLE_SUPPORTED"
+        private const val HINT_BROWSABLE = "android.media.browse.CONTENT_STYLE_BROWSABLE_HINT"
+        private const val HINT_PLAYABLE = "android.media.browse.CONTENT_STYLE_PLAYABLE_HINT"
+        private const val HINT_GROUP_TITLE = "android.media.browse.CONTENT_STYLE_GROUP_TITLE_HINT"
+        private const val STYLE_LIST = 1
+        private const val STYLE_GRID = 2
     }
 
     // ---- Sledování přehrávání (historie) ----------------------------------------------------
@@ -295,7 +337,15 @@ class MediaLibrarySessionCallback @Inject constructor(
         browser: MediaSession.ControllerInfo,
         params: LibraryParams?
     ): ListenableFuture<LibraryResult<MediaItem>> {
-        return Futures.immediateFuture(LibraryResult.ofItem(rootItem(), params))
+        // Výchozí vzhled stromu: složky, pohádky i rozposlouchané jako dlaždice s obrázkem.
+        // (Kapitoly uvnitř pohádky přepisují vzhled na seznam, viz storyItem.)
+        val rootExtras = Bundle().apply {
+            putBoolean(CONTENT_STYLE_SUPPORTED, true)
+            putInt(HINT_BROWSABLE, STYLE_GRID)
+            putInt(HINT_PLAYABLE, STYLE_GRID)
+        }
+        val rootParams = LibraryParams.Builder().setExtras(rootExtras).build()
+        return Futures.immediateFuture(LibraryResult.ofItem(rootItem(), rootParams))
     }
 
     override fun onGetChildren(
@@ -310,10 +360,10 @@ class MediaLibrarySessionCallback @Inject constructor(
             val items: List<MediaItem> = try {
                 when {
                     parentId == ROOT_ID -> rootChildren()
-                    parentId == RESUME_ID -> history.getAll().map { resumeItem(it) }
+                    parentId == RESUME_ID -> history.getAll().map { resumeItem(it, null) }
                     parentId.startsWith(CHUNK_PREFIX) -> chunkChildren(parentId)
+                    parentId.startsWith(MORE_PREFIX) -> moreChildren(parentId.removePrefix(MORE_PREFIX))
                     parentId.startsWith(AGE_PREFIX) -> ageChildren(parentId.removePrefix(AGE_PREFIX))
-                    parentId == ALL_ID || parentId.startsWith(DUR_PREFIX) -> listNodeChildren(parentId)
                     else -> loadTale(parentId)?.browseItems ?: emptyList()
                 }
             } catch (e: CancellationException) {
@@ -336,8 +386,8 @@ class MediaLibrarySessionCallback @Inject constructor(
             mediaId == ROOT_ID -> rootItem()
             trackItems.containsKey(mediaId) -> trackItems[mediaId]
             mediaId.startsWith(RESUME_ITEM_PREFIX) ->
-                history.get(mediaId.removePrefix(RESUME_ITEM_PREFIX))?.let { resumeItem(it) }
-            story != null -> storyItem(story)
+                history.get(mediaId.removePrefix(RESUME_ITEM_PREFIX))?.let { resumeItem(it, null) }
+            story != null -> storyItem(story, null)
             mediaId.startsWith("http://") || mediaId.startsWith("https://") ->
                 resolvePlayable(MediaItem.Builder().setMediaId(mediaId).build())
             else -> null
@@ -446,7 +496,7 @@ class MediaLibrarySessionCallback @Inject constructor(
     ): ListenableFuture<LibraryResult<ImmutableList<MediaItem>>> {
         return scope.future {
             val results: List<MediaItem> = try {
-                searchCatalog(query).map { storyItem(it) }
+                searchCatalog(query).map { storyItem(it, null) }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -459,24 +509,49 @@ class MediaLibrarySessionCallback @Inject constructor(
 
     private suspend fun searchCatalog(query: String): List<DetiTaleItem> {
         if (query.isBlank()) return emptyList()
-        return loadList(DetiOnlineParser.DEFAULT_CATALOG_URL)
+        return topPage()?.items.orEmpty()
             .filter { it.title.contains(query, ignoreCase = true) }
             .take(SEARCH_LIMIT)
     }
 
     // ---- Načítání dat ---------------------------------------------------------------------
 
-    private suspend fun loadList(url: String): List<DetiTaleItem> {
+    private suspend fun loadPage(url: String): CachedPage? {
         val cached = listCache[url]
         if (cached != null && SystemClock.elapsedRealtime() - cached.ts < LIST_TTL_MS) {
-            return cached.items
+            return cached
         }
-        val fresh = detiParser.getCatalog(url)
-        if (fresh.isNotEmpty()) {
-            listCache[url] = CachedList(fresh, SystemClock.elapsedRealtime())
+        // Souběžné požadavky na stejnou URL sdílejí jedno stahování.
+        val job = inFlight.getOrPut(url) { scope.async { fetchPage(url) } }
+        try {
+            return job.await()
+        } finally {
+            if (job.isCompleted) inFlight.remove(url, job)
+        }
+    }
+
+    private suspend fun fetchPage(url: String): CachedPage? {
+        val page = detiParser.getCatalogPage(url)
+        if (page.items.isNotEmpty()) {
+            val fresh = CachedPage(page.items, page.ageLinks, SystemClock.elapsedRealtime())
+            listCache[url] = fresh
             return fresh
         }
-        return cached?.items ?: emptyList() // web nedostupný -> raději stará data než nic
+        return listCache[url] // web nedostupný -> raději stará data než nic
+    }
+
+    /** Úvodní stránka s "top pohádkami" (první dostupná z TOP_URLS). */
+    private suspend fun topPage(): CachedPage? {
+        for (url in DetiOnlineParser.TOP_URLS) {
+            val page = loadPage(url)
+            if (page != null && page.items.isNotEmpty()) return page
+        }
+        return null
+    }
+
+    private suspend fun ageGroups(): List<AgeGroup> {
+        val links = topPage()?.ageLinks?.takeIf { it.size >= 2 } ?: FALLBACK_AGE_LINKS
+        return links.mapIndexed { index, link -> ageGroupOf(link, index) }
     }
 
     private fun findTale(id: String): DetiTaleItem? {
@@ -512,59 +587,65 @@ class MediaLibrarySessionCallback @Inject constructor(
 
     // ---- Uzly stromu ----------------------------------------------------------------------
 
-    private fun rootChildren(): List<MediaItem> {
+    private suspend fun rootChildren(): List<MediaItem> {
         val items = mutableListOf<MediaItem>()
-        if (history.getAll().isNotEmpty()) {
-            items.add(folderItem(RESUME_ID, "Pokračovat v poslechu"))
+
+        for (entry in history.getAll().take(MAX_RESUME_TILES)) {
+            items.add(resumeItem(entry, GROUP_RESUME))
         }
-        for (group in AGE_GROUPS) {
-            items.add(folderItem("$AGE_PREFIX${group.key}", group.label))
+        for (group in ageGroups()) {
+            items.add(ageItem(group, GROUP_AGE))
         }
-        items.add(folderItem(ALL_ID, "Všechny pohádky"))
+        items.addAll(talesWithMore(TOP_ID, topPage()?.items.orEmpty(), GROUP_TOP))
         return items
     }
 
-    /** Věková kategorie -> složky podle délky (nebo rovnou pohádky, když se délku nepodařilo načíst). */
+    /** Pohádky vybrané pro věk (v pořadí z webu = podle oblíbenosti). */
     private suspend fun ageChildren(key: String): List<MediaItem> {
-        val group = AGE_GROUPS.firstOrNull { it.key == key } ?: return emptyList()
-        val list = loadList(group.url)
-        if (list.isEmpty()) return emptyList()
-
-        if (list.count { it.durationMin != null } < list.size / 2) {
-            return listNodeChildren("$AGE_PREFIX$key")
-        }
-        return DURATION_LABELS.indices.mapNotNull { bucket ->
-            val count = list.count { durationBucket(it.durationMin) == bucket }
-            if (count == 0) null
-            else folderItem("$DUR_PREFIX$key|$bucket", "${DURATION_LABELS[bucket]} · $count")
-        }
+        val group = ageGroups().firstOrNull { it.key == key } ?: return emptyList()
+        val page = loadPage(group.url) ?: return emptyList()
+        return talesWithMore("$AGE_PREFIX$key", page.items, "Top pohádky – ${group.label}")
     }
 
-    /** Úplný seznam pohádek pro uzel (Všechny / věk / věk+délka). */
-    private suspend fun listFor(nodeId: String): List<DetiTaleItem> {
-        if (nodeId == ALL_ID) return loadList(DetiOnlineParser.DEFAULT_CATALOG_URL)
-        if (nodeId.startsWith(AGE_PREFIX)) {
-            val group = AGE_GROUPS.firstOrNull { it.key == nodeId.removePrefix(AGE_PREFIX) }
-                ?: return emptyList()
-            return loadList(group.url)
+    /** Prvních GROUP_SIZE pohádek jako dlaždice + dlaždice "Další pohádky" na zbytek. */
+    private fun talesWithMore(nodeId: String, list: List<DetiTaleItem>, group: String): List<MediaItem> {
+        val items = list.take(GROUP_SIZE).map { storyItem(it, group) }.toMutableList()
+        if (list.size > GROUP_SIZE) {
+            items.add(
+                folderItem(
+                    id = "$MORE_PREFIX$nodeId",
+                    title = "Další pohádky",
+                    artworkUrl = list.getOrNull(GROUP_SIZE)?.artworkUrl,
+                    group = group,
+                    subtitle = "ještě ${list.size - GROUP_SIZE}"
+                )
+            )
         }
-        if (nodeId.startsWith(DUR_PREFIX)) {
-            val parts = nodeId.removePrefix(DUR_PREFIX).split("|")
-            val group = AGE_GROUPS.firstOrNull { it.key == parts.getOrNull(0) } ?: return emptyList()
-            val bucket = parts.getOrNull(1)?.toIntOrNull() ?: return emptyList()
-            return loadList(group.url).filter { durationBucket(it.durationMin) == bucket }
+        return items
+    }
+
+    /** Úplný seznam pohádek pro uzel (Top / věk). */
+    private suspend fun listFor(nodeId: String): List<DetiTaleItem> {
+        if (nodeId == TOP_ID) return topPage()?.items.orEmpty()
+        if (nodeId.startsWith(AGE_PREFIX)) {
+            val key = nodeId.removePrefix(AGE_PREFIX)
+            val group = ageGroups().firstOrNull { it.key == key } ?: return emptyList()
+            return loadPage(group.url)?.items.orEmpty()
         }
         return emptyList()
     }
 
-    /** Je pohádek víc než GROUP_SIZE -> rozdělí je do složek "Pohádky 1–30" apod. */
-    private suspend fun listNodeChildren(nodeId: String): List<MediaItem> {
+    /** "Další pohádky" -> složky "Pohádky 31–60", "61–90", ... (prvních 30 je už vidět nahoře). */
+    private suspend fun moreChildren(nodeId: String): List<MediaItem> {
         val list = listFor(nodeId)
-        if (list.size <= GROUP_SIZE) return list.map { storyItem(it) }
-        return list.chunked(GROUP_SIZE).mapIndexed { index, chunk ->
-            val from = index * GROUP_SIZE + 1
+        return list.chunked(GROUP_SIZE).withIndex().drop(1).map { (k, chunk) ->
+            val from = k * GROUP_SIZE + 1
             val to = from + chunk.size - 1
-            folderItem("$CHUNK_PREFIX$nodeId|$index", "Pohádky $from–$to")
+            folderItem(
+                id = "$CHUNK_PREFIX$nodeId|$k",
+                title = "Pohádky $from–$to",
+                artworkUrl = chunk.firstOrNull { !it.artworkUrl.isNullOrBlank() }?.artworkUrl
+            )
         }
     }
 
@@ -577,40 +658,106 @@ class MediaLibrarySessionCallback @Inject constructor(
         return listFor(nodeId)
             .drop(index * GROUP_SIZE)
             .take(GROUP_SIZE)
-            .map { storyItem(it) }
+            .map { storyItem(it, null) }
     }
 
     // ---- Stavba MediaItemů ----------------------------------------------------------------
 
+    private fun groupExtras(group: String?): Bundle? =
+        if (group == null) null else Bundle().apply { putString(HINT_GROUP_TITLE, group) }
+
     private fun rootItem(): MediaItem = folderItem(ROOT_ID, "Pohádky Děti Online")
 
-    private fun folderItem(id: String, title: String): MediaItem =
-        MediaItem.Builder()
+    private fun folderItem(
+        id: String,
+        title: String,
+        artworkUrl: String? = null,
+        artworkData: ByteArray? = null,
+        group: String? = null,
+        subtitle: String? = null
+    ): MediaItem {
+        val metadata = MediaMetadata.Builder()
+            .setTitle(title)
+            .setSubtitle(subtitle)
+            .setArtworkUri(artworkUrl?.takeIf { it.isNotBlank() }?.let { Uri.parse(it) })
+            .setExtras(groupExtras(group))
+            .setIsBrowsable(true)
+            .setIsPlayable(false)
+        if (artworkData != null) {
+            metadata.setArtworkData(artworkData, MediaMetadata.PICTURE_TYPE_FRONT_COVER)
+        }
+        return MediaItem.Builder()
             .setMediaId(id)
-            .setMediaMetadata(
-                MediaMetadata.Builder()
-                    .setTitle(title)
-                    .setIsBrowsable(true)
-                    .setIsPlayable(false)
-                    .build()
-            )
+            .setMediaMetadata(metadata.build())
             .build()
+    }
 
-    private fun storyItem(story: DetiTaleItem): MediaItem =
-        MediaItem.Builder()
+    /** Dlaždice věkového filtru s vygenerovaným obrázkem ("4–5" / "let"). */
+    private fun ageItem(group: AgeGroup, groupTitle: String): MediaItem =
+        folderItem(
+            id = "$AGE_PREFIX${group.key}",
+            title = group.label,
+            artworkData = chipArtwork(group),
+            group = groupTitle
+        )
+
+    private fun chipArtwork(group: AgeGroup): ByteArray? {
+        val cacheKey = "${group.chipBig}|${group.chipSub}|${group.color}"
+        chipCache[cacheKey]?.let { return it }
+        return try {
+            val size = 320
+            val bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+            val canvas = Canvas(bitmap)
+            val background = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = group.color }
+            canvas.drawRoundRect(RectF(0f, 0f, size.toFloat(), size.toFloat()), 56f, 56f, background)
+
+            val big = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.WHITE
+                textSize = if (group.chipBig.length > 3) 104f else 136f
+                typeface = Typeface.DEFAULT_BOLD
+                textAlign = Paint.Align.CENTER
+            }
+            canvas.drawText(group.chipBig, size / 2f, size / 2f + 24f, big)
+
+            val small = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.WHITE
+                textSize = 56f
+                typeface = Typeface.DEFAULT
+                textAlign = Paint.Align.CENTER
+            }
+            canvas.drawText(group.chipSub, size / 2f, size / 2f + 104f, small)
+
+            val out = ByteArrayOutputStream()
+            bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
+            out.toByteArray().also { chipCache[cacheKey] = it }
+        } catch (e: Exception) {
+            Timber.tag(TAG).w(e, "Generování obrázku věku selhalo")
+            null
+        }
+    }
+
+    private fun storyItem(story: DetiTaleItem, group: String?): MediaItem {
+        val extras = Bundle().apply {
+            putInt(HINT_PLAYABLE, STYLE_LIST) // kapitoly uvnitř pohádky jako seznam
+            if (group != null) putString(HINT_GROUP_TITLE, group)
+        }
+        return MediaItem.Builder()
             .setMediaId(story.id) // URL detailu pohádky
             .setMediaMetadata(
                 MediaMetadata.Builder()
                     .setTitle(story.title)
+                    .setSubtitle(formatDuration(story.durationMin)) // délka jako na webu
+                    .setArtworkUri(story.artworkUrl?.takeIf { it.isNotBlank() }?.let { Uri.parse(it) })
+                    .setExtras(extras)
                     .setIsBrowsable(true) // Lze rozkliknout na kapitoly
                     .setIsPlayable(false)
-                    .setArtworkUri(story.artworkUrl?.takeIf { it.isNotBlank() }?.let { Uri.parse(it) })
                     .build()
             )
             .build()
+    }
 
     /** Položka v "Pokračovat": přehratelná, po klepnutí naváže tam, kde se skončilo. */
-    private fun resumeItem(entry: DetiResumeEntry): MediaItem =
+    private fun resumeItem(entry: DetiResumeEntry, group: String?): MediaItem =
         MediaItem.Builder()
             .setMediaId("$RESUME_ITEM_PREFIX${entry.taleId}")
             .setMediaMetadata(
@@ -618,6 +765,7 @@ class MediaLibrarySessionCallback @Inject constructor(
                     .setTitle(entry.title.ifEmpty { "Pohádka" })
                     .setSubtitle("Kapitola ${entry.trackIndex + 1} · ${formatTime(entry.positionMs)}")
                     .setArtworkUri(entry.artworkUrl?.takeIf { it.isNotBlank() }?.let { Uri.parse(it) })
+                    .setExtras(groupExtras(group))
                     .setIsBrowsable(false)
                     .setIsPlayable(true)
                     .build()
@@ -671,6 +819,17 @@ class MediaLibrarySessionCallback @Inject constructor(
     }
 
     // ---- Pomocné --------------------------------------------------------------------------
+
+    private fun formatDuration(minutes: Int?): String? {
+        if (minutes == null || minutes <= 0) return null
+        val h = minutes / 60
+        val m = minutes % 60
+        return when {
+            h > 0 && m > 0 -> "$h h $m min"
+            h > 0 -> "$h h"
+            else -> "$m min"
+        }
+    }
 
     private fun formatTime(ms: Long): String {
         val total = (ms / 1000).coerceAtLeast(0L)
