@@ -1,12 +1,6 @@
 package echo.music.iad1tya.playback
 
 import android.content.Context
-import android.graphics.Bitmap
-import android.graphics.Canvas
-import android.graphics.Color
-import android.graphics.Paint
-import android.graphics.RectF
-import android.graphics.Typeface
 import android.net.Uri
 import android.os.Bundle
 import android.os.Looper
@@ -41,58 +35,17 @@ import kotlinx.coroutines.guava.future
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import timber.log.Timber
-import java.io.ByteArrayOutputStream
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
 import javax.inject.Singleton
-
-private data class AgeGroup(
-    val key: String,
-    val label: String,
-    val url: String,
-    val chipBig: String,
-    val chipSub: String,
-    val color: Int
-)
-
-private val CHIP_COLORS = intArrayOf(
-    0xFF5C6BC0.toInt(), 0xFF26A69A.toInt(), 0xFFEF5350.toInt(),
-    0xFFFFA726.toInt(), 0xFF66BB6A.toInt(), 0xFFAB47BC.toInt()
-)
-
-/** Záloha, kdyby se věkové filtry z webu nepodařilo načíst. */
-private val FALLBACK_AGE_LINKS = listOf(
-    DetiAgeLink("dlya-malyshey-2-3-let", DetiOnlineParser.AGE_2_3_URL, 2, 3),
-    DetiAgeLink("dlya-detey-4-5-let", DetiOnlineParser.AGE_4_5_URL, 4, 5),
-    DetiAgeLink("dlya-detey-6-7-let", DetiOnlineParser.AGE_6_7_URL, 6, 7)
-)
-
-private fun ageGroupOf(link: DetiAgeLink, index: Int): AgeGroup {
-    val max = link.maxAge
-    val big: String
-    val sub: String
-    val label: String
-    when {
-        max == null && link.minAge == 0 -> { big = "0+"; sub = "nejmenší"; label = "Nejmenší (0+)" }
-        max == null -> { big = "${link.minAge}+"; sub = "let"; label = "${link.minAge}+ let" }
-        else -> {
-            big = "${link.minAge}–$max"
-            sub = if (max <= 3) "roky" else "let"
-            label = "$big $sub"
-        }
-    }
-    return AgeGroup(link.slug, label, link.url, big, sub, CHIP_COLORS[index % CHIP_COLORS.size])
-}
 
 /**
  * Android Auto / Media3 library callback pro pohádky z deti-online.com. Kopíruje uspořádání webu:
  *
  *   Úvodní obrazovka (dlaždice):
  *     [Pokračovat v poslechu]  rozposlouchané pohádky (jen když existují)
- *     [Podle věku]             0+ / 2–3 / 4–5 / 6–7 / 8–9 / 10+  (filtry z webu)
- *     [Top pohádky]            nejoblíbenější pohádky + "Další pohádky"
- *   Věk -> Top pohádky pro daný věk (+ "Další pohádky")
+ *     [Top pohádky]            katalog jako na webu (obrázek, název, délka) + "Další pohádky"
  *   Pohádka -> kapitoly (seznam)
  *
  * Historie: každých 15 s přehrávání, při pauze a při přechodu na další kapitolu se uloží
@@ -136,13 +89,11 @@ class MediaLibrarySessionCallback @Inject constructor(
     private val taleCache = ConcurrentHashMap<String, TaleData>()                 // URL pohádky -> kapitoly
     private val trackItems = ConcurrentHashMap<String, MediaItem>()               // trackId -> playItem
     private val trackToTale = ConcurrentHashMap<String, String>()                 // trackId -> URL pohádky
-    private val chipCache = ConcurrentHashMap<String, ByteArray>()                // vygenerované obrázky věků
 
     companion object {
         const val ROOT_ID = "ROOT_DETI_ONLINE"
         private const val RESUME_ID = "RESUME_DETI"
         private const val TOP_ID = "TOP_DETI"
-        private const val AGE_PREFIX = "AGE_DETI|"        // AGE_DETI|<slug>
         private const val MORE_PREFIX = "MORE_DETI|"      // MORE_DETI|<nodeId>
         private const val CHUNK_PREFIX = "CHUNK_DETI|"    // CHUNK_DETI|<nodeId>|<index>
         private const val RESUME_ITEM_PREFIX = "RESUME::" // RESUME::<URL pohádky> (přehratelné)
@@ -153,7 +104,6 @@ class MediaLibrarySessionCallback @Inject constructor(
         private const val EXTRA_TRACK_INDEX = "deti_track_index"
 
         private const val GROUP_RESUME = "Pokračovat v poslechu"
-        private const val GROUP_AGE = "Podle věku"
         private const val GROUP_TOP = "Top pohádky"
 
         private const val GROUP_SIZE = 30
@@ -363,7 +313,6 @@ class MediaLibrarySessionCallback @Inject constructor(
                     parentId == RESUME_ID -> history.getAll().map { resumeItem(it, null) }
                     parentId.startsWith(CHUNK_PREFIX) -> chunkChildren(parentId)
                     parentId.startsWith(MORE_PREFIX) -> moreChildren(parentId.removePrefix(MORE_PREFIX))
-                    parentId.startsWith(AGE_PREFIX) -> ageChildren(parentId.removePrefix(AGE_PREFIX))
                     else -> loadTale(parentId)?.browseItems ?: emptyList()
                 }
             } catch (e: CancellationException) {
@@ -549,11 +498,6 @@ class MediaLibrarySessionCallback @Inject constructor(
         return null
     }
 
-    private suspend fun ageGroups(): List<AgeGroup> {
-        val links = topPage()?.ageLinks?.takeIf { it.size >= 2 } ?: FALLBACK_AGE_LINKS
-        return links.mapIndexed { index, link -> ageGroupOf(link, index) }
-    }
-
     private fun findTale(id: String): DetiTaleItem? {
         for (cached in listCache.values) {
             cached.items.firstOrNull { it.id == id }?.let { return it }
@@ -593,18 +537,8 @@ class MediaLibrarySessionCallback @Inject constructor(
         for (entry in history.getAll().take(MAX_RESUME_TILES)) {
             items.add(resumeItem(entry, GROUP_RESUME))
         }
-        for (group in ageGroups()) {
-            items.add(ageItem(group, GROUP_AGE))
-        }
         items.addAll(talesWithMore(TOP_ID, topPage()?.items.orEmpty(), GROUP_TOP))
         return items
-    }
-
-    /** Pohádky vybrané pro věk (v pořadí z webu = podle oblíbenosti). */
-    private suspend fun ageChildren(key: String): List<MediaItem> {
-        val group = ageGroups().firstOrNull { it.key == key } ?: return emptyList()
-        val page = loadPage(group.url) ?: return emptyList()
-        return talesWithMore("$AGE_PREFIX$key", page.items, "Top pohádky – ${group.label}")
     }
 
     /** Prvních GROUP_SIZE pohádek jako dlaždice + dlaždice "Další pohádky" na zbytek. */
@@ -624,14 +558,9 @@ class MediaLibrarySessionCallback @Inject constructor(
         return items
     }
 
-    /** Úplný seznam pohádek pro uzel (Top / věk). */
+    /** Úplný seznam pohádek pro uzel (Top). */
     private suspend fun listFor(nodeId: String): List<DetiTaleItem> {
         if (nodeId == TOP_ID) return topPage()?.items.orEmpty()
-        if (nodeId.startsWith(AGE_PREFIX)) {
-            val key = nodeId.removePrefix(AGE_PREFIX)
-            val group = ageGroups().firstOrNull { it.key == key } ?: return emptyList()
-            return loadPage(group.url)?.items.orEmpty()
-        }
         return emptyList()
     }
 
@@ -690,50 +619,6 @@ class MediaLibrarySessionCallback @Inject constructor(
             .setMediaId(id)
             .setMediaMetadata(metadata.build())
             .build()
-    }
-
-    /** Dlaždice věkového filtru s vygenerovaným obrázkem ("4–5" / "let"). */
-    private fun ageItem(group: AgeGroup, groupTitle: String): MediaItem =
-        folderItem(
-            id = "$AGE_PREFIX${group.key}",
-            title = group.label,
-            artworkData = chipArtwork(group),
-            group = groupTitle
-        )
-
-    private fun chipArtwork(group: AgeGroup): ByteArray? {
-        val cacheKey = "${group.chipBig}|${group.chipSub}|${group.color}"
-        chipCache[cacheKey]?.let { return it }
-        return try {
-            val size = 320
-            val bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
-            val canvas = Canvas(bitmap)
-            val background = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = group.color }
-            canvas.drawRoundRect(RectF(0f, 0f, size.toFloat(), size.toFloat()), 56f, 56f, background)
-
-            val big = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                color = Color.WHITE
-                textSize = if (group.chipBig.length > 3) 104f else 136f
-                typeface = Typeface.DEFAULT_BOLD
-                textAlign = Paint.Align.CENTER
-            }
-            canvas.drawText(group.chipBig, size / 2f, size / 2f + 24f, big)
-
-            val small = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                color = Color.WHITE
-                textSize = 56f
-                typeface = Typeface.DEFAULT
-                textAlign = Paint.Align.CENTER
-            }
-            canvas.drawText(group.chipSub, size / 2f, size / 2f + 104f, small)
-
-            val out = ByteArrayOutputStream()
-            bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
-            out.toByteArray().also { chipCache[cacheKey] = it }
-        } catch (e: Exception) {
-            Timber.tag(TAG).w(e, "Generování obrázku věku selhalo")
-            null
-        }
     }
 
     private fun storyItem(story: DetiTaleItem, group: String?): MediaItem {
