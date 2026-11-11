@@ -40,13 +40,14 @@ class DetiOnlineParser {
         private const val TIMEOUT_MS = 10_000
 
         const val TOP_URL = "https://deti-online.com/audioskazki/"
-        const val DEFAULT_CATALOG_URL = "https://deti-online.com/audioskazki/sbornik-skazok-mp3/"
+        const val SBORNIK_SKAZOK_URL = "https://deti-online.com/audioskazki/sbornik-skazok-mp3/"
+        const val DEFAULT_CATALOG_URL = "TOP_URL"
         const val AGE_2_3_URL = "https://deti-online.com/audioskazki/dlya-malyshey-2-3-let/"
         const val AGE_4_5_URL = "https://deti-online.com/audioskazki/dlya-detey-4-5-let/"
         const val AGE_6_7_URL = "https://deti-online.com/audioskazki/dlya-detey-6-7-let/"
 
         /** Odkud se bere "Top pohádek" (první dostupná stránka s výsledky). */
-        val TOP_URLS = listOf(TOP_URL, DEFAULT_CATALOG_URL)
+        val TOP_URLS = listOf(TOP_URL, SBORNIK_SKAZOK_URL)
 
         private val HOURS_MIN_REGEX = Regex("""(\d+)\s*ч(?!\p{L})\s*(?:(\d+)\s*мин(?!\p{L}))?""")
         private val MINUTES_REGEX = Regex("""(\d+)\s*мин(?!\p{L})""")
