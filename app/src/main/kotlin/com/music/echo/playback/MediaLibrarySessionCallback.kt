@@ -43,9 +43,10 @@ import javax.inject.Singleton
 /**
  * Android Auto / Media3 library callback pro pohádky z deti-online.com. Kopíruje uspořádání webu:
  *
- *   Úvodní obrazovka (dlaždice):
- *     [Pokračovat v poslechu]  rozposlouchané pohádky (jen když existují)
- *     [Top pohádky]            katalog jako na webu (obrázek, název, délka) + "Další pohádky"
+ *   Záložky nahoře (kořen):
+ *     [Pokračovat]              rozposlouchané pohádky (jen když existují)
+ *     [1–30] [31–60] [61–90]... stránky katalogu po GROUP_SIZE pohádkách
+ *   Stránka -> pohádky jako dlaždice (obrázek, název, délka)
  *   Pohádka -> kapitoly (seznam)
  *
  * Historie: každých 15 s přehrávání, při pauze a při přechodu na další kapitolu se uloží
@@ -93,9 +94,7 @@ class MediaLibrarySessionCallback @Inject constructor(
     companion object {
         const val ROOT_ID = "ROOT_DETI_ONLINE"
         private const val RESUME_ID = "RESUME_DETI"
-        private const val TOP_ID = "TOP_DETI"
-        private const val MORE_PREFIX = "MORE_DETI|"      // MORE_DETI|<nodeId>
-        private const val CHUNK_PREFIX = "CHUNK_DETI|"    // CHUNK_DETI|<nodeId>|<index>
+        private const val PAGE_PREFIX = "PAGE_DETI|"      // PAGE_DETI|<index stránky od 0>
         private const val RESUME_ITEM_PREFIX = "RESUME::" // RESUME::<URL pohádky> (přehratelné)
 
         private const val EXTRA_TALE_ID = "deti_tale_id"
@@ -103,11 +102,9 @@ class MediaLibrarySessionCallback @Inject constructor(
         private const val EXTRA_TALE_ARTWORK = "deti_tale_artwork"
         private const val EXTRA_TRACK_INDEX = "deti_track_index"
 
-        private const val GROUP_RESUME = "Pokračovat v poslechu"
-        private const val GROUP_TOP = "Top pohádky"
+        private const val TAB_RESUME = "Pokračovat"
 
-        private const val GROUP_SIZE = 30
-        private const val MAX_RESUME_TILES = 4
+        private const val GROUP_SIZE = 30 // pohádek na jednu stránku (záložku)
         private const val SEARCH_LIMIT = 30
         private const val LIST_TTL_MS = 30 * 60_000L
         private const val TALE_TTL_MS = 6 * 60 * 60_000L
@@ -311,8 +308,7 @@ class MediaLibrarySessionCallback @Inject constructor(
                 when {
                     parentId == ROOT_ID -> rootChildren()
                     parentId == RESUME_ID -> history.getAll().map { resumeItem(it, null) }
-                    parentId.startsWith(CHUNK_PREFIX) -> chunkChildren(parentId)
-                    parentId.startsWith(MORE_PREFIX) -> moreChildren(parentId.removePrefix(MORE_PREFIX))
+                    parentId.startsWith(PAGE_PREFIX) -> pageChildren(parentId)
                     else -> loadTale(parentId)?.browseItems ?: emptyList()
                 }
             } catch (e: CancellationException) {
@@ -333,6 +329,9 @@ class MediaLibrarySessionCallback @Inject constructor(
         val story = findTale(mediaId)
         val item: MediaItem? = when {
             mediaId == ROOT_ID -> rootItem()
+            mediaId == RESUME_ID -> resumeFolderItem()
+            mediaId.startsWith(PAGE_PREFIX) ->
+                mediaId.removePrefix(PAGE_PREFIX).toIntOrNull()?.let { pageItem(it) }
             trackItems.containsKey(mediaId) -> trackItems[mediaId]
             mediaId.startsWith(RESUME_ITEM_PREFIX) ->
                 history.get(mediaId.removePrefix(RESUME_ITEM_PREFIX))?.let { resumeItem(it, null) }
@@ -531,69 +530,55 @@ class MediaLibrarySessionCallback @Inject constructor(
 
     // ---- Uzly stromu ----------------------------------------------------------------------
 
+    /** Kořen = záložky nahoře: [Pokračovat] (jen když existuje historie) + stránky 1–30, 31–60, ... */
     private suspend fun rootChildren(): List<MediaItem> {
         val items = mutableListOf<MediaItem>()
 
-        for (entry in history.getAll().take(MAX_RESUME_TILES)) {
-            items.add(resumeItem(entry, GROUP_RESUME))
-        }
-        items.addAll(talesWithMore(TOP_ID, topPage()?.items.orEmpty(), GROUP_TOP))
+        if (history.getAll().isNotEmpty()) items.add(resumeFolderItem())
+
+        val total = topPage()?.items?.size ?: 0
+        val pages = (total + GROUP_SIZE - 1) / GROUP_SIZE
+        for (k in 0 until pages) items.add(pageItem(k, total))
         return items
     }
 
-    /** Prvních GROUP_SIZE pohádek jako dlaždice + dlaždice "Další pohádky" na zbytek. */
-    private fun talesWithMore(nodeId: String, list: List<DetiTaleItem>, group: String): List<MediaItem> {
-        val items = list.take(GROUP_SIZE).map { storyItem(it, group) }.toMutableList()
-        if (list.size > GROUP_SIZE) {
-            items.add(
-                folderItem(
-                    id = "$MORE_PREFIX$nodeId",
-                    title = "Další pohádky",
-                    artworkUrl = list.getOrNull(GROUP_SIZE)?.artworkUrl,
-                    group = group,
-                    subtitle = "ještě ${list.size - GROUP_SIZE}"
-                )
-            )
-        }
-        return items
-    }
-
-    /** Úplný seznam pohádek pro uzel (Top). */
-    private suspend fun listFor(nodeId: String): List<DetiTaleItem> {
-        if (nodeId == TOP_ID) return topPage()?.items.orEmpty()
-        return emptyList()
-    }
-
-    /** "Další pohádky" -> složky "Pohádky 31–60", "61–90", ... (prvních 30 je už vidět nahoře). */
-    private suspend fun moreChildren(nodeId: String): List<MediaItem> {
-        val list = listFor(nodeId)
-        return list.chunked(GROUP_SIZE).withIndex().drop(1).map { (k, chunk) ->
-            val from = k * GROUP_SIZE + 1
-            val to = from + chunk.size - 1
-            folderItem(
-                id = "$CHUNK_PREFIX$nodeId|$k",
-                title = "Pohádky $from–$to",
-                artworkUrl = chunk.firstOrNull { !it.artworkUrl.isNullOrBlank() }?.artworkUrl
-            )
-        }
-    }
-
-    private suspend fun chunkChildren(chunkId: String): List<MediaItem> {
-        val rest = chunkId.removePrefix(CHUNK_PREFIX)
-        val sep = rest.lastIndexOf('|')
-        if (sep < 0) return emptyList()
-        val nodeId = rest.substring(0, sep)
-        val index = rest.substring(sep + 1).toIntOrNull() ?: return emptyList()
-        return listFor(nodeId)
+    /** Obsah jedné stránky: pohádky jako dlaždice; po klepnutí se otevřou kapitoly (loadTale). */
+    private suspend fun pageChildren(pageId: String): List<MediaItem> {
+        val index = pageId.removePrefix(PAGE_PREFIX).toIntOrNull() ?: return emptyList()
+        return topPage()?.items.orEmpty()
             .drop(index * GROUP_SIZE)
             .take(GROUP_SIZE)
             .map { storyItem(it, null) }
     }
 
+    /** Záložka stránky, např. "1–30". Děti (pohádky) se zobrazí jako dlaždice. */
+    private fun pageItem(index: Int, total: Int = Int.MAX_VALUE): MediaItem {
+        val from = index * GROUP_SIZE + 1
+        val to = minOf(from + GROUP_SIZE - 1, total)
+        val title = if (from >= to) "$from" else "$from–$to"
+        return folderItem(id = "$PAGE_PREFIX$index", title = title, childStyle = STYLE_GRID)
+    }
+
+    /** Záložka "Pokračovat" - rozposlouchané pohádky taky jako dlaždice. */
+    private fun resumeFolderItem(): MediaItem =
+        folderItem(id = RESUME_ID, title = TAB_RESUME, childStyle = STYLE_GRID)
+
     // ---- Stavba MediaItemů ----------------------------------------------------------------
 
     private fun groupExtras(group: String?): Bundle? =
         if (group == null) null else Bundle().apply { putString(HINT_GROUP_TITLE, group) }
+
+    /** childStyle = jak Android Auto vykreslí DĚTI této složky (dlaždice / seznam). */
+    private fun folderExtras(group: String?, childStyle: Int?): Bundle? {
+        if (group == null && childStyle == null) return null
+        return Bundle().apply {
+            if (group != null) putString(HINT_GROUP_TITLE, group)
+            if (childStyle != null) {
+                putInt(HINT_BROWSABLE, childStyle)
+                putInt(HINT_PLAYABLE, childStyle)
+            }
+        }
+    }
 
     private fun rootItem(): MediaItem = folderItem(ROOT_ID, "Pohádky Děti Online")
 
@@ -603,13 +588,14 @@ class MediaLibrarySessionCallback @Inject constructor(
         artworkUrl: String? = null,
         artworkData: ByteArray? = null,
         group: String? = null,
-        subtitle: String? = null
+        subtitle: String? = null,
+        childStyle: Int? = null
     ): MediaItem {
         val metadata = MediaMetadata.Builder()
             .setTitle(title)
             .setSubtitle(subtitle)
             .setArtworkUri(artworkUrl?.takeIf { it.isNotBlank() }?.let { Uri.parse(it) })
-            .setExtras(groupExtras(group))
+            .setExtras(folderExtras(group, childStyle))
             .setIsBrowsable(true)
             .setIsPlayable(false)
         if (artworkData != null) {
